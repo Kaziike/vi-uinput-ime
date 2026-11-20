@@ -1,0 +1,44 @@
+# /etc/systemd/system/vi-uinput-ime-vni.service
+# Systemd daemon unit running vi-uinput-ime-vni under isolated system user `vi-ime`.
+
+[Unit]
+Description=Low-Latency Linux Vietnamese VNI IME (evdev/uinput + Custom XKB + Strict FIFO)
+After=systemd-udevd.service local-fs.target
+Wants=systemd-udevd.service
+Conflicts=vi-uinput-ime-telex.service
+
+[Service]
+Type=simple
+User=vi-ime
+Group=vi-ime
+SupplementaryGroups=input
+ExecStart=/usr/local/bin/vi-uinput-ime-vni --config /etc/vi-uinput-ime-vni/config.toml
+Restart=on-failure
+RestartSec=1
+TimeoutStopSec=5
+KillSignal=SIGTERM
+
+# Runtime directory for Waybar/Polybar state indicator (/run/vi-uinput-ime-vni/state)
+RuntimeDirectory=vi-uinput-ime-vni
+RuntimeDirectoryMode=0755
+
+# Security Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=-/dev/uinput /dev/input /run/vi-uinput-ime-vni
+
+# Optional: pass user session IPC env file for Hyprland/Sway/X11 focus monitoring
+EnvironmentFile=-/run/vi-uinput-ime-vni/session.env
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+
+.playwright-cli/
+
+
+# Rust build artifacts
+vi-uinput-ime-telex/target/
+vi-uinput-ime-vni/target/

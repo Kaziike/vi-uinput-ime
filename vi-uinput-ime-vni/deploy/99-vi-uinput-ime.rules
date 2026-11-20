@@ -1,0 +1,13 @@
+# /etc/udev/rules.d/99-vi-uinput-ime.rules
+# Least-privilege device permissions for vi-uinput-ime daemon.
+# Create dedicated system group/user before reloading udev:
+#   sudo groupadd --system vi-ime
+#   sudo useradd --system --gid vi-ime --no-create-home --shell /usr/sbin/nologin vi-ime
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# Allow vi-ime group to create virtual input devices via /dev/uinput
+# OPTIONS+="static_node=uinput" ensures Arch/CachyOS applies GROUP/MODE even before uinput is loaded
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="vi-ime", MODE="0660", TAG+="uaccess", OPTIONS+="static_node=uinput"
+
+# Allow vi-ime group to grab physical keyboards and passively monitor mice
+SUBSYSTEM=="input", KERNEL=="event[0-9]*", GROUP="vi-ime", MODE="0660"
