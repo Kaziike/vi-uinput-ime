@@ -42,7 +42,9 @@ pub fn classify_device(path: &Path) -> Option<DiscoveredDevice> {
         && (Key::KEY_A.code()..=Key::KEY_L.code()).all(|c| keys.contains(Key::new(c)))
         && (Key::KEY_Z.code()..=Key::KEY_M.code()).all(|c| keys.contains(Key::new(c)));
 
-    let has_mouse_buttons = keys.contains(Key::BTN_LEFT) || keys.contains(Key::BTN_RIGHT);
+    let has_mouse_buttons = keys.contains(Key::BTN_LEFT)
+        || keys.contains(Key::BTN_RIGHT)
+        || keys.contains(Key::BTN_MIDDLE);
 
     if has_alpha_keys && !has_mouse_buttons {
         return Some(DiscoveredDevice {

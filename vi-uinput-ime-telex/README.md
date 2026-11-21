@@ -1,10 +1,9 @@
-# `vi-uinput-ime-telex` — Bộ gõ Telex 
+# `vi-uinput-ime-telex` — Bộ gõ Telex (evdev + uinput + Custom XKB)
 
 
 ## 1. Biên dịch & Kiểm thử
 
 ```bash
-cd vi-uinput-ime-telex
 cargo test
 cargo build --release
 ```
@@ -12,7 +11,7 @@ cargo build --release
 ## 2. Cài đặt phân quyền (`uinput` + `udev` + `systemd`)
 
 ```bash
-# Tạo user/group hệ thống
+# Tạo user/group hệ thống (bỏ qua nếu đã tạo)
 sudo groupadd --system vi-ime 2>/dev/null || true
 sudo useradd --system --gid vi-ime --no-create-home --shell /usr/sbin/nologin vi-ime 2>/dev/null || true
 
@@ -36,7 +35,7 @@ sudo systemctl disable --now vi-uinput-ime-vni.service 2>/dev/null || true
 sudo systemctl enable --now vi-uinput-ime-telex.service
 ```
 
-## 3. Kích hoạt layout XKB (`vi_uinput`)
+## 3. Kích hoạt layout XKB 134 ký tự (`vi_uinput`)
 
 ### GNOME / Mutter Wayland
 ```bash

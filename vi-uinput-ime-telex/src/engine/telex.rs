@@ -1,6 +1,10 @@
 use crate::config::ToneStyle;
 use crate::engine::{diff_words_to_output, InputEngine};
 use crate::input::emitter::OutputItem;
+use std::collections::VecDeque;
+
+/// Maximum number of word/separator entries retained in the history ring buffer.
+pub const MAX_HISTORY_ENTRIES: usize = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VowelShape {
@@ -20,7 +24,7 @@ enum Tone {
     DotBelow = 5,  // nặng (j)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Letter {
     base: char, // lowercase ASCII 'a'..'z'
     upper: bool,
@@ -82,29 +86,21 @@ fn compose_vn_vowel(base: char, shape: VowelShape, tone: Tone) -> Option<char> {
     table.map(|t| t[idx])
 }
 
-/// Pure Telex Vietnamese input engine.
-/// Only consumes ASCII letters (`a..z`, `A..Z`); digits (`0..9`) and symbols are never intercepted.
-pub struct TelexEngine {
-    tone_style: ToneStyle,
+/// Complete internal state of a single Vietnamese syllable/word (case, vowel shapes, tones, rendered text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyllableState {
     letters: Vec<Letter>,
     rendered: String,
     disabled_for_word: bool,
 }
 
-impl TelexEngine {
-    pub fn new(tone_style: ToneStyle) -> Self {
+impl SyllableState {
+    fn new() -> Self {
         Self {
-            tone_style,
             letters: Vec::with_capacity(16),
             rendered: String::with_capacity(32),
             disabled_for_word: false,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn set_tone_style(&mut self, tone_style: ToneStyle) {
-        self.tone_style = tone_style;
-        self.reposition_existing_tone();
     }
 
     fn render_buffer(&self) -> String {
@@ -145,7 +141,7 @@ impl TelexEngine {
         }
     }
 
-    fn pick_tone_target(&self) -> Option<usize> {
+    fn pick_tone_target(&self, tone_style: ToneStyle) -> Option<usize> {
         let vowels = self.nucleus_vowel_indices();
         if vowels.is_empty() {
             return None;
@@ -177,7 +173,7 @@ impl TelexEngine {
         }
 
         match pair {
-            ('o', 'a') | ('o', 'e') | ('u', 'y') => match self.tone_style {
+            ('o', 'a') | ('o', 'e') | ('u', 'y') => match tone_style {
                 ToneStyle::New => Some(v1),
                 ToneStyle::Old => Some(v0),
             },
@@ -198,19 +194,19 @@ impl TelexEngine {
         }
     }
 
-    fn reposition_existing_tone(&mut self) {
+    fn reposition_existing_tone(&mut self, tone_style: ToneStyle) {
         let tone = self.current_tone();
         if tone == Tone::None {
             return;
         }
         self.clear_all_tones();
-        if let Some(idx) = self.pick_tone_target() {
+        if let Some(idx) = self.pick_tone_target(tone_style) {
             self.letters[idx].tone = tone;
         }
     }
 
-    fn apply_tone(&mut self, tone: Tone) -> bool {
-        let Some(target) = self.pick_tone_target() else {
+    fn apply_tone(&mut self, tone: Tone, tone_style: ToneStyle) -> bool {
+        let Some(target) = self.pick_tone_target(tone_style) else {
             return false;
         };
         let existing = self.current_tone();
@@ -247,24 +243,35 @@ impl TelexEngine {
         false
     }
 
-    fn apply_circumflex(&mut self, target_base: char) -> bool {
+    /// Applies circumflex (`â`, `ê`, `ô`), allowing overwrite from `ă`/`ơ` (e.g. `Năng`+`a` -> `Nâng`).
+    fn apply_circumflex(&mut self, target_base: char, tone_style: ToneStyle) -> bool {
         for i in (0..self.letters.len()).rev() {
             if self.letters[i].base == target_base {
                 if self.letters[i].shape == VowelShape::Circumflex {
                     self.letters[i].shape = VowelShape::Plain;
-                    self.reposition_existing_tone();
+                    self.reposition_existing_tone(tone_style);
                     self.disabled_for_word = true;
                     return false;
                 }
+                // Converting `ươ` -> `uô` (e.g. `bươn` + `o` -> `buôn`) clears horn on preceding `u`.
+                if target_base == 'o'
+                    && i > 0
+                    && self.letters[i - 1].base == 'u'
+                    && self.letters[i - 1].shape == VowelShape::Horn
+                {
+                    self.letters[i - 1].shape = VowelShape::Plain;
+                }
                 self.letters[i].shape = VowelShape::Circumflex;
-                self.reposition_existing_tone();
+                self.reposition_existing_tone(tone_style);
                 return true;
             }
         }
         false
     }
 
-    fn apply_horn_or_breve(&mut self) -> bool {
+    /// Applies horn (`ơ`, `ư`, `ươ`) or breve (`ă`), allowing overwrite from `â`/`ô` (e.g. `Nâng`+`w` -> `Năng`).
+    /// Does NOT turn standalone `w` into `ư`.
+    fn apply_horn_or_breve(&mut self, tone_style: ToneStyle) -> bool {
         let len = self.letters.len();
 
         if len >= 2 {
@@ -277,13 +284,13 @@ impl TelexEngine {
                         {
                             self.letters[i].shape = VowelShape::Plain;
                             self.letters[i + 1].shape = VowelShape::Plain;
-                            self.reposition_existing_tone();
+                            self.reposition_existing_tone(tone_style);
                             self.disabled_for_word = true;
                             return false;
                         }
                         self.letters[i].shape = VowelShape::Horn;
                         self.letters[i + 1].shape = VowelShape::Horn;
-                        self.reposition_existing_tone();
+                        self.reposition_existing_tone(tone_style);
                         return true;
                     }
                 }
@@ -295,12 +302,12 @@ impl TelexEngine {
                 'a' => {
                     if self.letters[i].shape == VowelShape::Breve {
                         self.letters[i].shape = VowelShape::Plain;
-                        self.reposition_existing_tone();
+                        self.reposition_existing_tone(tone_style);
                         self.disabled_for_word = true;
                         return false;
                     }
                     self.letters[i].shape = VowelShape::Breve;
-                    self.reposition_existing_tone();
+                    self.reposition_existing_tone(tone_style);
                     return true;
                 }
                 'o' | 'u' => {
@@ -314,12 +321,12 @@ impl TelexEngine {
                     }
                     if self.letters[i].shape == VowelShape::Horn {
                         self.letters[i].shape = VowelShape::Plain;
-                        self.reposition_existing_tone();
+                        self.reposition_existing_tone(tone_style);
                         self.disabled_for_word = true;
                         return false;
                     }
                     self.letters[i].shape = VowelShape::Horn;
-                    self.reposition_existing_tone();
+                    self.reposition_existing_tone(tone_style);
                     return true;
                 }
                 _ => {}
@@ -328,83 +335,168 @@ impl TelexEngine {
         false
     }
 
-    fn try_transform(&mut self, c: char) -> bool {
+    fn try_transform(&mut self, c: char, tone_style: ToneStyle) -> bool {
         if self.disabled_for_word {
             return false;
         }
         match c.to_ascii_lowercase() {
-            's' => self.apply_tone(Tone::Acute),
-            'f' => self.apply_tone(Tone::Grave),
-            'r' => self.apply_tone(Tone::HookAbove),
-            'x' => self.apply_tone(Tone::Tilde),
-            'j' => self.apply_tone(Tone::DotBelow),
+            's' => self.apply_tone(Tone::Acute, tone_style),
+            'f' => self.apply_tone(Tone::Grave, tone_style),
+            'r' => self.apply_tone(Tone::HookAbove, tone_style),
+            'x' => self.apply_tone(Tone::Tilde, tone_style),
+            'j' => self.apply_tone(Tone::DotBelow, tone_style),
             'z' => self.remove_tone(),
             'd' => self.apply_d_bar(),
-            'a' => self.apply_circumflex('a'),
-            'e' => self.apply_circumflex('e'),
-            'o' => self.apply_circumflex('o'),
-            'w' => {
-                if self.apply_horn_or_breve() {
-                    true
-                } else {
-                    let mut u = Letter::from_ascii(if c.is_ascii_uppercase() { 'U' } else { 'u' });
-                    u.shape = VowelShape::Horn;
-                    self.letters.push(u);
-                    self.reposition_existing_tone();
-                    true
-                }
-            }
+            'a' => self.apply_circumflex('a', tone_style),
+            'e' => self.apply_circumflex('e', tone_style),
+            'o' => self.apply_circumflex('o', tone_style),
+            // No standalone `w -> ư` shorthand: `w` only modifies existing `a`, `o`, `u`, `uo`.
+            'w' => self.apply_horn_or_breve(tone_style),
             _ => false,
         }
     }
 }
 
+/// Entry stored in the bounded history ring buffer for Word History Restoration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryEntry {
+    Word(SyllableState),
+    Separator(char),
+}
+
+/// Pure Telex Vietnamese input engine with Word History Restoration & vowel diacritic overwrite.
+/// Only consumes ASCII letters (`a..z`, `A..Z`); digits (`0..9`) and symbols are never intercepted.
+pub struct TelexEngine {
+    tone_style: ToneStyle,
+    active_word: Option<SyllableState>,
+    history: VecDeque<HistoryEntry>,
+}
+
+impl TelexEngine {
+    pub fn new(tone_style: ToneStyle) -> Self {
+        Self {
+            tone_style,
+            active_word: None,
+            history: VecDeque::with_capacity(MAX_HISTORY_ENTRIES),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_tone_style(&mut self, tone_style: ToneStyle) {
+        self.tone_style = tone_style;
+        if let Some(word) = &mut self.active_word {
+            word.reposition_existing_tone(tone_style);
+            word.rendered = word.render_buffer();
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    fn push_history(&mut self, entry: HistoryEntry) {
+        while self.history.len() >= MAX_HISTORY_ENTRIES {
+            self.history.pop_front();
+        }
+        self.history.push_back(entry);
+    }
+}
+
 impl InputEngine for TelexEngine {
     fn process_char(&mut self, c: char) -> Option<Vec<OutputItem>> {
+        if c == ' ' {
+            self.process_separator(' ');
+            return None;
+        }
         if !c.is_ascii_alphabetic() {
-            self.reset();
+            self.clear_all();
             return None;
         }
 
-        let old_rendered = self.rendered.clone();
-        let transformed = self.try_transform(c);
+        let tone_style = self.tone_style;
+        let word = self.active_word.get_or_insert_with(SyllableState::new);
+        let old_rendered = word.rendered.clone();
+        let transformed = word.try_transform(c, tone_style);
 
         if !transformed {
-            self.letters.push(Letter::from_ascii(c));
-            let len = self.letters.len();
+            word.letters.push(Letter::from_ascii(c));
+            let len = word.letters.len();
             if len >= 3
-                && self.letters[len - 3].base == 'u'
-                && self.letters[len - 3].shape == VowelShape::Horn
-                && self.letters[len - 2].base == 'o'
-                && self.letters[len - 2].shape == VowelShape::Plain
+                && word.letters[len - 3].base == 'u'
+                && word.letters[len - 3].shape == VowelShape::Horn
+                && word.letters[len - 2].base == 'o'
+                && word.letters[len - 2].shape == VowelShape::Plain
             {
-                self.letters[len - 2].shape = VowelShape::Horn;
+                word.letters[len - 2].shape = VowelShape::Horn;
             }
-            self.reposition_existing_tone();
+            word.reposition_existing_tone(tone_style);
         }
 
-        let new_rendered = self.render_buffer();
-        self.rendered = new_rendered.clone();
+        let new_rendered = word.render_buffer();
+        word.rendered = new_rendered.clone();
 
         Some(diff_words_to_output(&old_rendered, &new_rendered))
     }
 
-    fn process_backspace(&mut self) {
-        self.letters.pop();
-        self.rendered = self.render_buffer();
-        if self.letters.is_empty() {
-            self.disabled_for_word = false;
+    fn process_separator(&mut self, sep: char) {
+        if let Some(word) = self.active_word.take() {
+            if !word.letters.is_empty() {
+                self.push_history(HistoryEntry::Word(word));
+            }
         }
+        self.push_history(HistoryEntry::Separator(sep));
     }
 
-    fn reset(&mut self) {
-        self.letters.clear();
-        self.rendered.clear();
-        self.disabled_for_word = false;
+    fn process_backspace(&mut self) -> Option<Vec<OutputItem>> {
+        // Case A: active_word currently has characters.
+        if let Some(mut word) = self.active_word.take() {
+            let old_rendered = word.rendered.clone();
+            let mut expected_if_raw_bs = old_rendered.clone();
+            expected_if_raw_bs.pop();
+
+            word.letters.pop();
+
+            if word.letters.is_empty() {
+                // Active word is now empty; leave active_word = None WITHOUT popping history
+                // because the preceding separator is still on screen.
+                return None;
+            }
+
+            word.reposition_existing_tone(self.tone_style);
+            let new_rendered = word.render_buffer();
+            word.rendered = new_rendered.clone();
+            self.active_word = Some(word);
+
+            if new_rendered == expected_if_raw_bs {
+                // Smooth raw Backspace passthrough (no redraw, ideal for key repeat).
+                return None;
+            }
+
+            return Some(diff_words_to_output(&old_rendered, &new_rendered));
+        }
+
+        // Case B: active_word is None — pop separator and restore preceding Word if directly underneath.
+        if let Some(HistoryEntry::Separator(_)) = self.history.pop_back() {
+            if matches!(self.history.back(), Some(HistoryEntry::Word(_))) {
+                if let Some(HistoryEntry::Word(restored)) = self.history.pop_back() {
+                    self.active_word = Some(restored);
+                }
+            }
+        }
+        None
+    }
+
+    fn clear_all(&mut self) {
+        self.active_word = None;
+        self.history.clear();
     }
 
     fn current_word(&self) -> &str {
-        &self.rendered
+        self.active_word
+            .as_ref()
+            .map(|w| w.rendered.as_str())
+            .unwrap_or("")
     }
 }
 
@@ -412,69 +504,127 @@ impl InputEngine for TelexEngine {
 mod tests {
     use super::*;
 
+    fn apply_batch(screen: &mut Vec<char>, items: &[OutputItem]) {
+        for item in items {
+            match *item {
+                OutputItem::Backspace => {
+                    screen.pop();
+                }
+                OutputItem::VietnameseChar(c) | OutputItem::AsciiChar(c) => {
+                    screen.push(c);
+                }
+                OutputItem::PassThrough { .. } => {}
+            }
+        }
+    }
+
     fn simulate_typing(engine: &mut TelexEngine, input: &str) -> String {
         let mut screen: Vec<char> = Vec::new();
         for ch in input.chars() {
             match engine.process_char(ch) {
-                Some(items) => {
-                    for item in items {
-                        match item {
-                            OutputItem::Backspace => {
-                                screen.pop();
-                            }
-                            OutputItem::VietnameseChar(c) | OutputItem::AsciiChar(c) => {
-                                screen.push(c);
-                            }
-                            OutputItem::PassThrough { .. } => {}
-                        }
-                    }
-                }
+                Some(items) => apply_batch(&mut screen, &items),
                 None => screen.push(ch),
             }
         }
         screen.into_iter().collect()
     }
 
+    fn sim_backspace(engine: &mut TelexEngine, screen: &mut Vec<char>) -> Option<Vec<OutputItem>> {
+        let res = engine.process_backspace();
+        match &res {
+            Some(items) => apply_batch(screen, items),
+            None => {
+                screen.pop();
+            }
+        }
+        res
+    }
+
+    fn sim_char(engine: &mut TelexEngine, screen: &mut Vec<char>, ch: char) -> Option<Vec<OutputItem>> {
+        let res = engine.process_char(ch);
+        match &res {
+            Some(items) => apply_batch(screen, items),
+            None => screen.push(ch),
+        }
+        res
+    }
+
     #[test]
-    fn telex_complex_sentences_and_numbers() {
+    fn telex_complex_sentences_numbers_and_no_w_shorthand() {
         let mut engine = TelexEngine::new(ToneStyle::New);
         assert_eq!(simulate_typing(&mut engine, "tieesng vieejt"), "tiếng việt");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "traau"), "trâu");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "Traau"), "Trâu");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "duwowcj"), "dược");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "dduwowcj"), "được");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "duwowcjd"), "được");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "dduowcj"), "được");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "khuya"), "khuya");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "toios "), "tối ");
-        engine.reset();
-        assert_eq!(simulate_typing(&mut engine, "w"), "ư");
-        engine.reset();
+        engine.clear_all();
+        // Standalone `w` shorthand is disabled: `w`, `win`, `web`, `www` stay literal,
+        // while `uw` -> `ư`, `ow` -> `ơ`, `aw` -> `ă` still work normally.
+        assert_eq!(simulate_typing(&mut engine, "w"), "w");
+        engine.clear_all();
+        assert_eq!(simulate_typing(&mut engine, "W"), "W");
+        engine.clear_all();
+        assert_eq!(simulate_typing(&mut engine, "win"), "win");
+        engine.clear_all();
+        assert_eq!(simulate_typing(&mut engine, "web"), "web");
+        engine.clear_all();
+        assert_eq!(simulate_typing(&mut engine, "www"), "www");
+        engine.clear_all();
+        assert_eq!(simulate_typing(&mut engine, "uw"), "ư");
+        engine.clear_all();
+        assert_eq!(simulate_typing(&mut engine, "ow"), "ơ");
+        engine.clear_all();
+        assert_eq!(simulate_typing(&mut engine, "aw"), "ă");
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "hoaf"), "hoà");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "thuys"), "thuý");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "toiosz"), "tôi");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "nawm 2026"), "năm 2026");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "1234567890"), "1234567890");
     }
 
     #[test]
-    fn telex_old_tone_style() {
+    fn telex_old_tone_style_and_backspace_tone_reposition() {
         let mut engine = TelexEngine::new(ToneStyle::Old);
         assert_eq!(simulate_typing(&mut engine, "hoaf"), "hòa");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "thuys"), "thúy");
+        engine.clear_all();
+
+        // Typing `toans` -> `toán`; deleting `n` in Old style repositions acute to `o` (`tóa`).
+        let mut screen: Vec<char> = Vec::new();
+        for ch in "toans".chars() {
+            sim_char(&mut engine, &mut screen, ch);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "toán");
+        let diff = sim_backspace(&mut engine, &mut screen);
+        assert_eq!(
+            diff,
+            Some(vec![
+                OutputItem::Backspace,
+                OutputItem::Backspace,
+                OutputItem::Backspace,
+                OutputItem::VietnameseChar('ó'),
+                OutputItem::AsciiChar('a'),
+            ])
+        );
+        assert_eq!(screen.iter().collect::<String>(), "tóa");
     }
 
     #[test]
@@ -501,5 +651,157 @@ mod tests {
                 OutputItem::AsciiChar('i'),
             ])
         );
+    }
+
+    #[test]
+    fn vowel_diacritic_overwrite_both_directions() {
+        let mut engine = TelexEngine::new(ToneStyle::New);
+        // "Năng" + 'a' -> "Nâng"
+        assert_eq!(simulate_typing(&mut engine, "Nawnga"), "Nâng");
+        engine.clear_all();
+        // "Nâng" + 'w' -> "Năng"
+        assert_eq!(simulate_typing(&mut engine, "Naangw"), "Năng");
+        engine.clear_all();
+        // "bươn" + 'o' -> "buôn" and "buôn" + 'w' -> "bươn"
+        assert_eq!(simulate_typing(&mut engine, "buowwno"), "buowno"); // double w undoes
+        engine.clear_all();
+        assert_eq!(simulate_typing(&mut engine, "buowno"), "buôn");
+        engine.clear_all();
+        assert_eq!(simulate_typing(&mut engine, "buoonw"), "bươn");
+    }
+
+    #[test]
+    fn history_test_1_nang_space_bs_a_produces_nang_circumflex_with_minimal_diff() {
+        let mut engine = TelexEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+
+        for ch in "Nawng".chars() {
+            sim_char(&mut engine, &mut screen, ch);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "Năng");
+
+        // Press Space
+        sim_char(&mut engine, &mut screen, ' ');
+        assert_eq!(screen.iter().collect::<String>(), "Năng ");
+        assert_eq!(engine.current_word(), "");
+        assert_eq!(engine.history_len(), 2);
+
+        // Press Backspace -> deletes space & restores "Năng" into active_word
+        assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        assert_eq!(screen.iter().collect::<String>(), "Năng");
+        assert_eq!(engine.current_word(), "Năng");
+
+        // Press 'a' -> overwrites `ă` to `â` with exact minimal diff: 3 BS + "âng"
+        let batch = sim_char(&mut engine, &mut screen, 'a');
+        assert_eq!(
+            batch,
+            Some(vec![
+                OutputItem::Backspace,
+                OutputItem::Backspace,
+                OutputItem::Backspace,
+                OutputItem::VietnameseChar('â'),
+                OutputItem::AsciiChar('n'),
+                OutputItem::AsciiChar('g'),
+            ])
+        );
+        assert_eq!(screen.iter().collect::<String>(), "Nâng");
+    }
+
+    #[test]
+    fn history_test_2_double_space_single_bs_does_not_restore() {
+        let mut engine = TelexEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+
+        for ch in "Nawng  ".chars() {
+            sim_char(&mut engine, &mut screen, ch);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "Năng  ");
+
+        // Single Backspace only removes the 2nd space; 1st space remains on top -> do NOT restore
+        assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        assert_eq!(engine.current_word(), "");
+
+        let batch = sim_char(&mut engine, &mut screen, 'a');
+        assert_eq!(batch, Some(vec![OutputItem::AsciiChar('a')]));
+        assert_eq!(screen.iter().collect::<String>(), "Năng a");
+    }
+
+    #[test]
+    fn history_test_3_double_space_double_bs_restores_word() {
+        let mut engine = TelexEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+
+        for ch in "Nawng  ".chars() {
+            sim_char(&mut engine, &mut screen, ch);
+        }
+        assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        assert_eq!(engine.current_word(), "");
+        assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        assert_eq!(engine.current_word(), "Năng");
+
+        sim_char(&mut engine, &mut screen, 'a');
+        assert_eq!(screen.iter().collect::<String>(), "Nâng");
+    }
+
+    #[test]
+    fn history_test_4_delete_entire_second_word_and_space_restores_first_word() {
+        let mut engine = TelexEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+
+        for ch in "Tooi Nawng".chars() {
+            sim_char(&mut engine, &mut screen, ch);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "Tôi Năng");
+
+        // 4 Backspaces delete "Năng" (raw passthrough each time, no premature history pop)
+        for _ in 0..4 {
+            assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "Tôi ");
+        assert_eq!(engine.current_word(), "");
+
+        // 5th Backspace deletes Space and restores "Tôi"
+        assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        assert_eq!(screen.iter().collect::<String>(), "Tôi");
+        assert_eq!(engine.current_word(), "Tôi");
+
+        // Typing 's' transforms "Tôi" -> "Tối"
+        sim_char(&mut engine, &mut screen, 's');
+        assert_eq!(screen.iter().collect::<String>(), "Tối");
+    }
+
+    #[test]
+    fn history_test_5_clear_all_invalidates_history() {
+        let mut engine = TelexEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+
+        for ch in "Nawng ".chars() {
+            sim_char(&mut engine, &mut screen, ch);
+        }
+        assert_eq!(engine.history_len(), 2);
+
+        // Simulate IPC focus change or mouse click
+        engine.clear_all();
+        assert_eq!(engine.history_len(), 0);
+        assert_eq!(engine.current_word(), "");
+
+        // Backspace + 'a' must NOT modify "Năng"
+        assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        let batch = sim_char(&mut engine, &mut screen, 'a');
+        assert_eq!(batch, Some(vec![OutputItem::AsciiChar('a')]));
+        assert_eq!(screen.iter().collect::<String>(), "Nănga");
+    }
+
+    #[test]
+    fn history_ring_buffer_respects_max_capacity() {
+        let mut engine = TelexEngine::new(ToneStyle::New);
+        for i in 0..20 {
+            let word = if i % 2 == 0 { "an" } else { "em" };
+            for ch in word.chars() {
+                engine.process_char(ch);
+            }
+            engine.process_separator(' ');
+        }
+        assert_eq!(engine.history_len(), MAX_HISTORY_ENTRIES);
     }
 }

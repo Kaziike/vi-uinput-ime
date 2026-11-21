@@ -149,6 +149,10 @@ impl TelexRouter {
         }
     }
 
+    fn clear_all(&mut self) {
+        self.engine.clear_all();
+    }
+
     fn handle_raw_key(&mut self, code: Key, value: i32) -> (Vec<OutputItem>, Option<bool>) {
         // 1. Always track & forward modifier keys verbatim
         if self.mods.update(code, value) {
@@ -163,8 +167,12 @@ impl TelexRouter {
             return (Vec::new(), None);
         }
 
-        // 3. Key repeat (`value == 2`) for an already passed-through key: keep forwarding verbatim
-        if value == 2 && self.passthrough_held.contains(&code) {
+        // 3. Key repeat (`value == 2`) for already passed-through keys EXCEPT Backspace/Space
+        //    (Backspace and Space must update the history ring buffer on every repeat tick).
+        if value == 2
+            && !matches!(code, Key::KEY_BACKSPACE | Key::KEY_SPACE)
+            && self.passthrough_held.contains(&code)
+        {
             return (vec![OutputItem::PassThrough { code, value: 2 }], None);
         }
 
@@ -181,23 +189,51 @@ impl TelexRouter {
             };
         if toggle_hit {
             self.ime_enabled = !self.ime_enabled;
-            self.engine.reset();
+            self.engine.clear_all();
             return (Vec::new(), Some(self.ime_enabled));
         }
 
-        // 5. PassThrough when IME disabled, shortcut modifier held, or navigation reset key
+        // 5. Strict invalidation & PassThrough when IME disabled, Ctrl/Alt/Super held (e.g. Ctrl+Backspace),
+        //    or navigation / linear-flow-breaking key pressed.
         if !self.ime_enabled || self.mods.any_shortcut_modifier() || is_context_reset_key(code) {
+            if value == 1 || value == 2 {
+                self.engine.clear_all();
+            }
             if value == 1 {
-                self.engine.reset();
                 self.passthrough_held.insert(code);
             }
             return (vec![OutputItem::PassThrough { code, value }], None);
         }
 
-        // 6. Physical Backspace
+        // 6. Space separator: push active word + Separator(' ') into history ring buffer (including repeat!)
+        if code == Key::KEY_SPACE {
+            if value == 1 || value == 2 {
+                self.engine.process_separator(' ');
+            }
+            if value == 1 {
+                self.passthrough_held.insert(code);
+            }
+            return (vec![OutputItem::PassThrough { code, value }], None);
+        }
+
+        // 7. Physical Backspace (supports Word History Restoration + smooth raw repeat)
         if code == Key::KEY_BACKSPACE {
             if value == 1 || value == 2 {
-                self.engine.process_backspace();
+                if let Some(mut batch) = self.engine.process_backspace() {
+                    if self.passthrough_held.remove(&Key::KEY_BACKSPACE) {
+                        batch.insert(
+                            0,
+                            OutputItem::PassThrough {
+                                code: Key::KEY_BACKSPACE,
+                                value: 0,
+                            },
+                        );
+                    }
+                    return (batch, None);
+                }
+                if value == 2 && !self.passthrough_held.contains(&Key::KEY_BACKSPACE) {
+                    return (vec![OutputItem::Backspace], None);
+                }
             }
             if value == 1 {
                 self.passthrough_held.insert(code);
@@ -205,7 +241,7 @@ impl TelexRouter {
             return (vec![OutputItem::PassThrough { code, value }], None);
         }
 
-        // 7. Telex ASCII letters (`a..z`, `A..Z`)
+        // 8. Telex ASCII letters (`a..z`, `A..Z`)
         if let Some(ch) = key_to_telex_char(code, self.mods.shift(), self.mods.caps_lock) {
             if let Some(batch) = self.engine.process_char(ch) {
                 return (batch, None);
@@ -216,9 +252,11 @@ impl TelexRouter {
             return (vec![OutputItem::PassThrough { code, value }], None);
         }
 
-        // 8. Digits, punctuation, Space -> reset word buffer and pass through cleanly
+        // 9. Digits, punctuation, and other untracked keys -> clear_all() and pass through cleanly
+        if value == 1 || value == 2 {
+            self.engine.clear_all();
+        }
         if value == 1 {
-            self.engine.reset();
             self.passthrough_held.insert(code);
         }
         (vec![OutputItem::PassThrough { code, value }], None)
@@ -335,11 +373,11 @@ async fn main() -> Result<()> {
             }
             Some(event) = router_rx.recv() => {
                 match event {
-                    RouterEvent::MouseReset => {
-                        router.engine.reset();
+                    RouterEvent::MouseReset | RouterEvent::WorkspaceChanged => {
+                        router.clear_all();
                     }
                     RouterEvent::WindowFocusChanged { app_class, is_xwayland } => {
-                        router.engine.reset();
+                        router.clear_all();
                         let delay_ms = config.resolve_delay_ms(&app_class, is_xwayland);
                         emitter.set_delay_ms(delay_ms);
                     }
@@ -365,24 +403,67 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn apply_router_output(
+        screen: &mut Vec<char>,
+        virtual_held: &mut HashSet<Key>,
+        items: &[OutputItem],
+    ) {
+        for item in items {
+            match *item {
+                OutputItem::Backspace => {
+                    screen.pop();
+                }
+                OutputItem::VietnameseChar(c) | OutputItem::AsciiChar(c) => {
+                    screen.push(c);
+                }
+                OutputItem::PassThrough { code, value } => {
+                    if value == 1 {
+                        virtual_held.insert(code);
+                    } else if value == 0 {
+                        virtual_held.remove(&code);
+                    }
+                    if value == 1 || value == 2 {
+                        match code {
+                            Key::KEY_SPACE => screen.push(' '),
+                            Key::KEY_BACKSPACE => {
+                                screen.pop();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn tap_key(
+        router: &mut TelexRouter,
+        screen: &mut Vec<char>,
+        virtual_held: &mut HashSet<Key>,
+        code: Key,
+    ) -> Vec<OutputItem> {
+        let (down, _) = router.handle_raw_key(code, 1);
+        apply_router_output(screen, virtual_held, &down);
+        let (up, _) = router.handle_raw_key(code, 0);
+        apply_router_output(screen, virtual_held, &up);
+        down
+    }
+
     #[test]
     fn telex_router_never_sticks_digits_or_ctrl_shortcuts() {
         let mut router = TelexRouter::new(config::ToneStyle::New, true, ToggleHotkey::CtrlSpace);
         let mut virtual_held: HashSet<Key> = HashSet::new();
 
         let sequence = [
-            // Type standalone digits `1`, `2`, `3`
             (Key::KEY_1, 1),
             (Key::KEY_1, 0),
             (Key::KEY_2, 1),
             (Key::KEY_2, 2),
             (Key::KEY_2, 0),
-            // Hold Ctrl, press A, release Ctrl FIRST, then release A (classic stuck-key trap)
             (Key::KEY_LEFTCTRL, 1),
             (Key::KEY_A, 1),
             (Key::KEY_LEFTCTRL, 0),
             (Key::KEY_A, 0),
-            // Type Telex `traau`
             (Key::KEY_T, 1), (Key::KEY_T, 0),
             (Key::KEY_R, 1), (Key::KEY_R, 0),
             (Key::KEY_A, 1), (Key::KEY_A, 0),
@@ -404,6 +485,72 @@ mod tests {
         }
 
         assert!(virtual_held.is_empty(), "Stuck virtual keys: {:?}", virtual_held);
+        assert!(router.passthrough_held.is_empty());
+    }
+
+    #[test]
+    fn telex_router_history_restore_with_held_bs_repeat_and_strict_invalidation() {
+        let mut router = TelexRouter::new(config::ToneStyle::New, true, ToggleHotkey::CtrlSpace);
+        let mut screen: Vec<char> = Vec::new();
+        let mut held: HashSet<Key> = HashSet::new();
+
+        // Type "Tôi Năng" using raw evdev keycodes (Shift+T, o, o, i, Space, Shift+N, a, w, n, g)
+        let (items, _) = router.handle_raw_key(Key::KEY_LEFTSHIFT, 1);
+        apply_router_output(&mut screen, &mut held, &items);
+        tap_key(&mut router, &mut screen, &mut held, Key::KEY_T);
+        let (items, _) = router.handle_raw_key(Key::KEY_LEFTSHIFT, 0);
+        apply_router_output(&mut screen, &mut held, &items);
+        for k in [Key::KEY_O, Key::KEY_O, Key::KEY_I, Key::KEY_SPACE] {
+            tap_key(&mut router, &mut screen, &mut held, k);
+        }
+        let (items, _) = router.handle_raw_key(Key::KEY_LEFTSHIFT, 1);
+        apply_router_output(&mut screen, &mut held, &items);
+        tap_key(&mut router, &mut screen, &mut held, Key::KEY_N);
+        let (items, _) = router.handle_raw_key(Key::KEY_LEFTSHIFT, 0);
+        apply_router_output(&mut screen, &mut held, &items);
+        for k in [Key::KEY_A, Key::KEY_W, Key::KEY_N, Key::KEY_G] {
+            tap_key(&mut router, &mut screen, &mut held, k);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "Tôi Năng");
+
+        // Hold Backspace (1 initial press + 4 key-repeat ticks = 5 deletes) -> restores "Tôi"
+        let (items, _) = router.handle_raw_key(Key::KEY_BACKSPACE, 1);
+        apply_router_output(&mut screen, &mut held, &items);
+        for _ in 0..4 {
+            let (items, _) = router.handle_raw_key(Key::KEY_BACKSPACE, 2);
+            apply_router_output(&mut screen, &mut held, &items);
+        }
+        let (items, _) = router.handle_raw_key(Key::KEY_BACKSPACE, 0);
+        apply_router_output(&mut screen, &mut held, &items);
+        assert_eq!(screen.iter().collect::<String>(), "Tôi");
+
+        // Press 's' -> transforms restored "Tôi" into "Tối"
+        tap_key(&mut router, &mut screen, &mut held, Key::KEY_S);
+        assert_eq!(screen.iter().collect::<String>(), "Tối");
+
+        // Press Space, then simulate IPC WindowFocusChanged / MouseReset -> clear_all()
+        tap_key(&mut router, &mut screen, &mut held, Key::KEY_SPACE);
+        assert_eq!(router.engine.history_len(), 2);
+        router.clear_all();
+        assert_eq!(router.engine.history_len(), 0);
+
+        // Press Backspace + 'a' -> does NOT modify "Tối"
+        tap_key(&mut router, &mut screen, &mut held, Key::KEY_BACKSPACE);
+        let batch = tap_key(&mut router, &mut screen, &mut held, Key::KEY_A);
+        assert_eq!(batch, vec![OutputItem::AsciiChar('a')]);
+        assert_eq!(screen.iter().collect::<String>(), "Tốia");
+
+        // Ctrl+Backspace must also call clear_all()
+        tap_key(&mut router, &mut screen, &mut held, Key::KEY_SPACE);
+        assert!(router.engine.history_len() > 0);
+        let (items, _) = router.handle_raw_key(Key::KEY_LEFTCTRL, 1);
+        apply_router_output(&mut screen, &mut held, &items);
+        tap_key(&mut router, &mut screen, &mut held, Key::KEY_BACKSPACE);
+        let (items, _) = router.handle_raw_key(Key::KEY_LEFTCTRL, 0);
+        apply_router_output(&mut screen, &mut held, &items);
+        assert_eq!(router.engine.history_len(), 0);
+
+        assert!(held.is_empty(), "Stuck virtual keys: {:?}", held);
         assert!(router.passthrough_held.is_empty());
     }
 }

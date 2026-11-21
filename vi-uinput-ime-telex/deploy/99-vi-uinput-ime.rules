@@ -3,11 +3,17 @@
 # Create dedicated system group/user before reloading udev:
 #   sudo groupadd --system vi-ime
 #   sudo useradd --system --gid vi-ime --no-create-home --shell /usr/sbin/nologin vi-ime
-#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   sudo modprobe uinput
+#   sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=misc --subsystem-match=input
 
-# Allow vi-ime group to create virtual input devices via /dev/uinput
-# OPTIONS+="static_node=uinput" ensures Arch/CachyOS applies GROUP/MODE even before uinput is loaded
-KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="vi-ime", MODE="0660", TAG+="uaccess", OPTIONS+="static_node=uinput"
+# 1) Static node + primary group/mode for /dev/uinput (avoid TAG+="uaccess" here
+#    so systemd-logind does not reset group ACLs to g::---).
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="vi-ime", MODE="0660", OPTIONS+="static_node=uinput"
 
-# Allow vi-ime group to grab physical keyboards and passively monitor mice
-SUBSYSTEM=="input", KERNEL=="event[0-9]*", GROUP="vi-ime", MODE="0660"
+# 2) Explicitly grant POSIX ACL for `vi-ime` with rw mask on /dev/uinput so access
+#    survives third-party udev/uaccess rules (e.g. Steam, game-devices-udev, CachyOS).
+ACTION=="add|change", KERNEL=="uinput", SUBSYSTEM=="misc", RUN+="/usr/bin/setfacl -m g::rw,g:vi-ime:rw,m::rw /dev/uinput"
+
+# 3) Allow vi-ime group to grab keyboards & monitor mice without overwriting the
+#    default `input` group on /dev/input/event*.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event[0-9]*", RUN+="/usr/bin/setfacl -m g:vi-ime:rw /dev/input/%k"

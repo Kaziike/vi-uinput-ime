@@ -12,6 +12,9 @@ Type=simple
 User=vi-ime
 Group=vi-ime
 SupplementaryGroups=input
+ExecStartPre=+-/usr/bin/modprobe -q uinput
+ExecStartPre=+-/usr/bin/udevadm settle --timeout=5
+ExecStartPre=+-/usr/bin/setfacl -m g::rw,g:vi-ime:rw,m::rw /dev/uinput
 ExecStart=/usr/local/bin/vi-uinput-ime-telex --config /etc/vi-uinput-ime-telex/config.toml
 Restart=on-failure
 RestartSec=1

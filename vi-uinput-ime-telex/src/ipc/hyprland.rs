@@ -75,6 +75,12 @@ impl WindowMonitor for HyprlandMonitor {
                                     app_class,
                                     is_xwayland,
                                 });
+                            } else if line.starts_with("workspace>>")
+                                || line.starts_with("workspacev2>>")
+                                || line.starts_with("focusedmon>>")
+                            {
+                                debug!("Hyprland workspace/monitor changed: {}", line);
+                                let _ = router_tx.send(RouterEvent::WorkspaceChanged);
                             }
                         }
                     }

@@ -326,7 +326,7 @@ mod tests {
             }
         }
         // Space goes through the EXACT SAME single FIFO queue as PassThrough
-        engine.reset();
+        engine.process_separator(' ');
         handle.enqueue(OutputItem::PassThrough {
             code: Key::KEY_SPACE,
             value: 1,

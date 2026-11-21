@@ -3,11 +3,15 @@ pub mod telex;
 use crate::input::emitter::OutputItem;
 use crate::xkb_gen::lookup_vn_char;
 
-/// Trait implemented by Vietnamese input method engines.
+/// Trait implemented by Vietnamese input method engines with Word History Restoration.
 pub trait InputEngine: Send {
     fn process_char(&mut self, c: char) -> Option<Vec<OutputItem>>;
-    fn process_backspace(&mut self);
-    fn reset(&mut self);
+    fn process_separator(&mut self, sep: char);
+    /// Returns `None` when raw physical Backspace can pass through directly via FIFO,
+    /// or `Some(batch)` when deleting a character causes a tone mark to shift position.
+    fn process_backspace(&mut self) -> Option<Vec<OutputItem>>;
+    /// Strict context invalidation: clears BOTH active word and the entire history stack.
+    fn clear_all(&mut self);
     #[allow(dead_code)]
     fn current_word(&self) -> &str;
 }

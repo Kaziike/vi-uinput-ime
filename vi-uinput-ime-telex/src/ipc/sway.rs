@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 
 const I3_IPC_MAGIC: &[u8; 6] = b"i3-ipc";
 const IPC_SUBSCRIBE: u32 = 2;
+const IPC_EVENT_WORKSPACE: u32 = 0x8000_0000;
 const IPC_EVENT_WINDOW: u32 = 0x8000_0003;
 
 pub struct SwayMonitor;
@@ -66,7 +67,10 @@ impl WindowMonitor for SwayMonitor {
             loop {
                 match UnixStream::connect(&sock_path).await {
                     Ok(mut stream) => {
-                        if let Err(err) = write_ipc_frame(&mut stream, IPC_SUBSCRIBE, br#"["window"]"#).await {
+                        if let Err(err) =
+                            write_ipc_frame(&mut stream, IPC_SUBSCRIBE, br#"["window","workspace"]"#)
+                                .await
+                        {
                             warn!("Sway IPC subscribe failed: {}", err);
                             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                             continue;
@@ -75,6 +79,16 @@ impl WindowMonitor for SwayMonitor {
                         let _ = read_ipc_frame(&mut stream).await;
 
                         while let Ok((msg_type, payload)) = read_ipc_frame(&mut stream).await {
+                            if msg_type == IPC_EVENT_WORKSPACE {
+                                if let Ok(evt) = serde_json::from_slice::<SwayWindowEvent>(&payload)
+                                {
+                                    if evt.change == "focus" {
+                                        debug!("Sway workspace::focus changed");
+                                        let _ = router_tx.send(RouterEvent::WorkspaceChanged);
+                                    }
+                                }
+                                continue;
+                            }
                             if msg_type != IPC_EVENT_WINDOW {
                                 continue;
                             }
@@ -82,7 +96,8 @@ impl WindowMonitor for SwayMonitor {
                                 if evt.change == "focus" {
                                     if let Some(c) = evt.container {
                                         let is_xwayland =
-                                            c.shell.as_deref() == Some("xwayland") || c.window_properties.is_some();
+                                            c.shell.as_deref() == Some("xwayland")
+                                                || c.window_properties.is_some();
                                         let app_class = c
                                             .app_id
                                             .filter(|s| !s.is_empty())
