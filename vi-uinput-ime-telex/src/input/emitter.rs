@@ -1,6 +1,6 @@
 use crate::xkb_gen::{
-    lookup_vn_char, LEVEL5_MODIFIER_KEY, VIRTUAL_KBD_NAME, VIRTUAL_KBD_PRODUCT_ID,
-    VIRTUAL_KBD_VENDOR_ID, VN_KEY_SLOTS,
+    lookup_vn_char, LEVEL3_MODIFIER_KEY, LEVEL5_MODIFIER_KEY, VIRTUAL_KBD_NAME,
+    VIRTUAL_KBD_PRODUCT_ID, VIRTUAL_KBD_VENDOR_ID, VN_KEY_SLOTS,
 };
 use anyhow::{Context, Result};
 use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
@@ -20,7 +20,7 @@ pub enum OutputItem {
     PassThrough { code: Key, value: i32 },
     /// Emit a complete Backspace press + SYN + release + SYN cycle.
     Backspace,
-    /// Emit a precomposed Vietnamese character via `vi-uinput-virtual-kbd` XKB Level5/Level6.
+    /// Emit a precomposed Vietnamese character via `vi-uinput-virtual-kbd` XKB Levels 5–8.
     VietnameseChar(char),
     /// Emit a plain ASCII character (with Shift wrap when uppercase or shifted symbol).
     AsciiChar(char),
@@ -44,8 +44,9 @@ impl UinputSink {
         for code in 1u16..=248u16 {
             keys.insert(Key::new(code));
         }
-        // Guarantee all 67 VN XKB slots and Level5 modifier are registered
+        // Guarantee all 34 VN XKB carrier slots and Level5/Level3 modifiers are registered
         keys.insert(LEVEL5_MODIFIER_KEY);
+        keys.insert(LEVEL3_MODIFIER_KEY);
         for slot in VN_KEY_SLOTS {
             keys.insert(slot.key);
         }
@@ -97,7 +98,7 @@ pub fn encode_output_item_with_shift(
         }
         OutputItem::VietnameseChar(ch) => {
             if let Some(combo) = lookup_vn_char(*ch) {
-                let mut frames = Vec::with_capacity(6);
+                let mut frames = Vec::with_capacity(8);
                 let temp_release_shift = phys_shift_held && !combo.shift;
                 let temp_press_shift = !phys_shift_held && combo.shift;
 
@@ -107,6 +108,9 @@ pub fn encode_output_item_with_shift(
                 if combo.level5 {
                     frames.push(vec![key_ev(LEVEL5_MODIFIER_KEY, 1), syn()]);
                 }
+                if combo.level3 {
+                    frames.push(vec![key_ev(LEVEL3_MODIFIER_KEY, 1), syn()]);
+                }
                 if temp_press_shift {
                     frames.push(vec![key_ev(Key::KEY_LEFTSHIFT, 1), syn()]);
                 }
@@ -114,6 +118,9 @@ pub fn encode_output_item_with_shift(
                 frames.push(vec![key_ev(combo.key, 0), syn()]);
                 if temp_press_shift {
                     frames.push(vec![key_ev(Key::KEY_LEFTSHIFT, 0), syn()]);
+                }
+                if combo.level3 {
+                    frames.push(vec![key_ev(LEVEL3_MODIFIER_KEY, 0), syn()]);
                 }
                 if combo.level5 {
                     frames.push(vec![key_ev(LEVEL5_MODIFIER_KEY, 0), syn()]);
@@ -340,9 +347,10 @@ mod tests {
         drop(handle);
         worker.await.unwrap();
 
-        // Replay recorded EV_KEY press events through our XKB Level5 decoder
+        // Replay recorded EV_KEY press events through our XKB Levels 5–8 decoder
         let events = log.lock().unwrap();
         let mut level5 = false;
+        let mut level3 = false;
         let mut shift = false;
         let mut output: Vec<char> = Vec::new();
         let mut decoded_ops: Vec<String> = Vec::new();
@@ -355,6 +363,10 @@ mod tests {
             let val = ev.value();
             if key == LEVEL5_MODIFIER_KEY {
                 level5 = val != 0;
+                continue;
+            }
+            if key == LEVEL3_MODIFIER_KEY {
+                level3 = val != 0;
                 continue;
             }
             if key == Key::KEY_LEFTSHIFT {
@@ -372,7 +384,14 @@ mod tests {
                 decoded_ops.push("Space".to_string());
             } else if level5 {
                 let slot = VN_KEY_SLOTS.iter().find(|s| s.key == key).unwrap();
-                let ch = if shift { slot.upper } else { slot.lower };
+                let ch = if level3 {
+                    let (lo, up) = slot.l78.expect("slot missing Level7/8 pair");
+                    if shift { up } else { lo }
+                } else if shift {
+                    slot.l6_upper
+                } else {
+                    slot.l5_lower
+                };
                 output.push(ch);
                 decoded_ops.push(ch.to_string());
             } else {
