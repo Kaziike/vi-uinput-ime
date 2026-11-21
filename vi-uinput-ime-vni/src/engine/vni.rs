@@ -1,6 +1,10 @@
 use crate::config::ToneStyle;
 use crate::engine::{diff_words_to_output, InputEngine};
 use crate::input::emitter::OutputItem;
+use std::collections::VecDeque;
+
+/// Maximum number of word/separator entries retained in the history ring buffer.
+pub const MAX_HISTORY_ENTRIES: usize = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VowelShape {
@@ -24,13 +28,13 @@ enum Tone {
 enum TransformOutcome {
     /// Diacritic/tone was applied to the current word.
     Applied,
-    /// Repeated VNI modifier undid the previous diacritic/tone; caller must emit the undo diff + literal digit.
+    /// Repeated VNI modifier undid the previous diacritic/tone; caller emits undo diff + literal digit.
     Undone,
     /// Digit did not match any vowel/`d` in the current word; caller passes the digit through verbatim.
     NoMatch,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Letter {
     base: char,
     upper: bool,
@@ -92,34 +96,21 @@ fn compose_vn_vowel(base: char, shape: VowelShape, tone: Tone) -> Option<char> {
     table.map(|t| t[idx])
 }
 
-/// Pure VNI Vietnamese input engine:
-/// - `1`=sắc, `2`=huyền, `3`=hỏi, `4`=ngã, `5`=nặng, `0`=xóa dấu
-/// - `6`=mũ (â, ê, ô), `7`=móc (ơ, ư, uo→ươ), `8`=trăng (ă), `9`=đ
-/// - Standalone digits (`123`, `2026`) or non-applicable digits (`b1`, `t6`, `a0`) return `None`
-///   so the router forwards them untouched with full press/release tracking (zero stuck keys).
-/// - Double-tapping a VNI digit (`a11`, `a66`, `u77`, `a88`, `d99`) cleanly undoes the mark and
-///   emits the literal digit atomically.
-pub struct VniEngine {
-    tone_style: ToneStyle,
+/// Complete internal state of a single Vietnamese syllable/word (case, vowel shapes, tones, rendered text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyllableState {
     letters: Vec<Letter>,
     rendered: String,
     disabled_for_word: bool,
 }
 
-impl VniEngine {
-    pub fn new(tone_style: ToneStyle) -> Self {
+impl SyllableState {
+    fn new() -> Self {
         Self {
-            tone_style,
             letters: Vec::with_capacity(16),
             rendered: String::with_capacity(32),
             disabled_for_word: false,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn set_tone_style(&mut self, tone_style: ToneStyle) {
-        self.tone_style = tone_style;
-        self.reposition_existing_tone();
     }
 
     fn render_buffer(&self) -> String {
@@ -160,7 +151,7 @@ impl VniEngine {
         }
     }
 
-    fn pick_tone_target(&self) -> Option<usize> {
+    fn pick_tone_target(&self, tone_style: ToneStyle) -> Option<usize> {
         let vowels = self.nucleus_vowel_indices();
         if vowels.is_empty() {
             return None;
@@ -192,7 +183,7 @@ impl VniEngine {
         }
 
         match pair {
-            ('o', 'a') | ('o', 'e') | ('u', 'y') => match self.tone_style {
+            ('o', 'a') | ('o', 'e') | ('u', 'y') => match tone_style {
                 ToneStyle::New => Some(v1),
                 ToneStyle::Old => Some(v0),
             },
@@ -213,19 +204,19 @@ impl VniEngine {
         }
     }
 
-    fn reposition_existing_tone(&mut self) {
+    fn reposition_existing_tone(&mut self, tone_style: ToneStyle) {
         let tone = self.current_tone();
         if tone == Tone::None {
             return;
         }
         self.clear_all_tones();
-        if let Some(idx) = self.pick_tone_target() {
+        if let Some(idx) = self.pick_tone_target(tone_style) {
             self.letters[idx].tone = tone;
         }
     }
 
-    fn apply_tone(&mut self, tone: Tone) -> TransformOutcome {
-        let Some(target) = self.pick_tone_target() else {
+    fn apply_tone(&mut self, tone: Tone, tone_style: ToneStyle) -> TransformOutcome {
+        let Some(target) = self.pick_tone_target(tone_style) else {
             return TransformOutcome::NoMatch;
         };
         if self.current_tone() == tone {
@@ -261,27 +252,35 @@ impl VniEngine {
         TransformOutcome::NoMatch
     }
 
-    fn apply_circumflex(&mut self) -> TransformOutcome {
+    /// Applies circumflex (`6` -> `â`, `ê`, `ô`), allowing overwrite from `ă`/`ơ` (e.g. `Năng`+`6` -> `Nâng`).
+    fn apply_circumflex(&mut self, tone_style: ToneStyle) -> TransformOutcome {
         for i in (0..self.letters.len()).rev() {
             if matches!(self.letters[i].base, 'a' | 'e' | 'o') {
                 if self.letters[i].shape == VowelShape::Circumflex {
                     self.letters[i].shape = VowelShape::Plain;
-                    self.reposition_existing_tone();
+                    self.reposition_existing_tone(tone_style);
                     self.disabled_for_word = true;
                     return TransformOutcome::Undone;
                 }
+                if self.letters[i].base == 'o'
+                    && i > 0
+                    && self.letters[i - 1].base == 'u'
+                    && self.letters[i - 1].shape == VowelShape::Horn
+                {
+                    self.letters[i - 1].shape = VowelShape::Plain;
+                }
                 self.letters[i].shape = VowelShape::Circumflex;
-                self.reposition_existing_tone();
+                self.reposition_existing_tone(tone_style);
                 return TransformOutcome::Applied;
             }
         }
         TransformOutcome::NoMatch
     }
 
-    fn apply_horn(&mut self) -> TransformOutcome {
+    /// Applies horn (`7` -> `ơ`, `ư`, `ươ`), allowing overwrite from `ô` (e.g. `cô`+`7` -> `cơ`, `buôn`+`7` -> `bươn`).
+    fn apply_horn(&mut self, tone_style: ToneStyle) -> TransformOutcome {
         let len = self.letters.len();
 
-        // Check `uo` cluster first (e.g., `du7o7` or `duo7` -> `dươ`)
         if len >= 2 {
             for i in (0..len - 1).rev() {
                 if self.letters[i].base == 'u' && self.letters[i + 1].base == 'o' {
@@ -292,20 +291,19 @@ impl VniEngine {
                         {
                             self.letters[i].shape = VowelShape::Plain;
                             self.letters[i + 1].shape = VowelShape::Plain;
-                            self.reposition_existing_tone();
+                            self.reposition_existing_tone(tone_style);
                             self.disabled_for_word = true;
                             return TransformOutcome::Undone;
                         }
                         self.letters[i].shape = VowelShape::Horn;
                         self.letters[i + 1].shape = VowelShape::Horn;
-                        self.reposition_existing_tone();
+                        self.reposition_existing_tone(tone_style);
                         return TransformOutcome::Applied;
                     }
                 }
             }
         }
 
-        // Single vowel horn (`o` -> `ơ`, `u` -> `ư`)
         for i in (0..len).rev() {
             if matches!(self.letters[i].base, 'o' | 'u') {
                 if self.letters[i].base == 'u'
@@ -318,12 +316,12 @@ impl VniEngine {
                 }
                 if self.letters[i].shape == VowelShape::Horn {
                     self.letters[i].shape = VowelShape::Plain;
-                    self.reposition_existing_tone();
+                    self.reposition_existing_tone(tone_style);
                     self.disabled_for_word = true;
                     return TransformOutcome::Undone;
                 }
                 self.letters[i].shape = VowelShape::Horn;
-                self.reposition_existing_tone();
+                self.reposition_existing_tone(tone_style);
                 return TransformOutcome::Applied;
             }
         }
@@ -331,114 +329,211 @@ impl VniEngine {
         TransformOutcome::NoMatch
     }
 
-    fn apply_breve(&mut self) -> TransformOutcome {
+    /// Applies breve (`8` -> `ă`), allowing overwrite from `â` (e.g. `Nâng`+`8` -> `Năng`).
+    fn apply_breve(&mut self, tone_style: ToneStyle) -> TransformOutcome {
         for i in (0..self.letters.len()).rev() {
             if self.letters[i].base == 'a' {
                 if self.letters[i].shape == VowelShape::Breve {
                     self.letters[i].shape = VowelShape::Plain;
-                    self.reposition_existing_tone();
+                    self.reposition_existing_tone(tone_style);
                     self.disabled_for_word = true;
                     return TransformOutcome::Undone;
                 }
                 self.letters[i].shape = VowelShape::Breve;
-                self.reposition_existing_tone();
+                self.reposition_existing_tone(tone_style);
                 return TransformOutcome::Applied;
             }
         }
         TransformOutcome::NoMatch
     }
 
-    fn try_vni_digit(&mut self, c: char) -> TransformOutcome {
+    fn try_vni_digit(&mut self, c: char, tone_style: ToneStyle) -> TransformOutcome {
         if self.disabled_for_word || self.letters.is_empty() {
             return TransformOutcome::NoMatch;
         }
         match c {
-            '1' => self.apply_tone(Tone::Acute),
-            '2' => self.apply_tone(Tone::Grave),
-            '3' => self.apply_tone(Tone::HookAbove),
-            '4' => self.apply_tone(Tone::Tilde),
-            '5' => self.apply_tone(Tone::DotBelow),
+            '1' => self.apply_tone(Tone::Acute, tone_style),
+            '2' => self.apply_tone(Tone::Grave, tone_style),
+            '3' => self.apply_tone(Tone::HookAbove, tone_style),
+            '4' => self.apply_tone(Tone::Tilde, tone_style),
+            '5' => self.apply_tone(Tone::DotBelow, tone_style),
             '0' => self.remove_tone(),
-            '6' => self.apply_circumflex(),
-            '7' => self.apply_horn(),
-            '8' => self.apply_breve(),
+            '6' => self.apply_circumflex(tone_style),
+            '7' => self.apply_horn(tone_style),
+            '8' => self.apply_breve(tone_style),
             '9' => self.apply_d_bar(),
             _ => TransformOutcome::NoMatch,
         }
     }
 }
 
+/// Entry stored in the bounded history ring buffer for Word History Restoration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryEntry {
+    Word(SyllableState),
+    Separator(char),
+}
+
+/// Pure VNI Vietnamese input engine with Word History Restoration & vowel diacritic overwrite:
+/// - `1`=sắc, `2`=huyền, `3`=hỏi, `4`=ngã, `5`=nặng, `0`=xóa dấu
+/// - `6`=mũ (â, ê, ô), `7`=móc (ơ, ư, uo→ươ), `8`=trăng (ă), `9`=đ
+pub struct VniEngine {
+    tone_style: ToneStyle,
+    active_word: Option<SyllableState>,
+    history: VecDeque<HistoryEntry>,
+}
+
+impl VniEngine {
+    pub fn new(tone_style: ToneStyle) -> Self {
+        Self {
+            tone_style,
+            active_word: None,
+            history: VecDeque::with_capacity(MAX_HISTORY_ENTRIES),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_tone_style(&mut self, tone_style: ToneStyle) {
+        self.tone_style = tone_style;
+        if let Some(word) = &mut self.active_word {
+            word.reposition_existing_tone(tone_style);
+            word.rendered = word.render_buffer();
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    fn push_history(&mut self, entry: HistoryEntry) {
+        while self.history.len() >= MAX_HISTORY_ENTRIES {
+            self.history.pop_front();
+        }
+        self.history.push_back(entry);
+    }
+}
+
 impl InputEngine for VniEngine {
     fn process_char(&mut self, c: char) -> Option<Vec<OutputItem>> {
+        if c == ' ' {
+            self.process_separator(' ');
+            return None;
+        }
+
         // Handle VNI modifier digits `0..9`
         if matches!(c, '0'..='9') {
-            if self.letters.is_empty() {
+            let tone_style = self.tone_style;
+            let Some(word) = self.active_word.as_mut() else {
+                // Standalone digit emitted on screen -> invalidate history so Backspace stays in sync.
+                self.clear_all();
                 return None;
-            }
-            let old_rendered = self.rendered.clone();
-            match self.try_vni_digit(c) {
+            };
+            let old_rendered = word.rendered.clone();
+            match word.try_vni_digit(c, tone_style) {
                 TransformOutcome::Applied => {
-                    let new_rendered = self.render_buffer();
-                    self.rendered = new_rendered.clone();
+                    let new_rendered = word.render_buffer();
+                    word.rendered = new_rendered.clone();
                     return Some(diff_words_to_output(&old_rendered, &new_rendered));
                 }
                 TransformOutcome::Undone => {
-                    // Emit minimal undo diff (e.g., `á` -> `a`) + literal digit (`1`), then reset word
-                    let new_rendered = self.render_buffer();
+                    let new_rendered = word.render_buffer();
                     let mut batch = diff_words_to_output(&old_rendered, &new_rendered);
                     batch.push(OutputItem::AsciiChar(c));
-                    self.reset();
+                    self.clear_all();
                     return Some(batch);
                 }
                 TransformOutcome::NoMatch => {
-                    // Non-applicable digit: reset active word and pass raw digit through verbatim
-                    self.reset();
+                    self.clear_all();
                     return None;
                 }
             }
         }
 
         if !c.is_ascii_alphabetic() {
-            self.reset();
+            self.clear_all();
             return None;
         }
 
-        let old_rendered = self.rendered.clone();
-        self.letters.push(Letter::from_ascii(c));
+        let tone_style = self.tone_style;
+        let word = self.active_word.get_or_insert_with(SyllableState::new);
+        let old_rendered = word.rendered.clone();
+        word.letters.push(Letter::from_ascii(c));
 
         // Auto-horn `o` -> `ơ` when typing a coda after `ưo` (e.g., `d9u7oc5` -> `được`)
-        let len = self.letters.len();
+        let len = word.letters.len();
         if len >= 3
-            && self.letters[len - 3].base == 'u'
-            && self.letters[len - 3].shape == VowelShape::Horn
-            && self.letters[len - 2].base == 'o'
-            && self.letters[len - 2].shape == VowelShape::Plain
+            && word.letters[len - 3].base == 'u'
+            && word.letters[len - 3].shape == VowelShape::Horn
+            && word.letters[len - 2].base == 'o'
+            && word.letters[len - 2].shape == VowelShape::Plain
         {
-            self.letters[len - 2].shape = VowelShape::Horn;
+            word.letters[len - 2].shape = VowelShape::Horn;
         }
-        self.reposition_existing_tone();
+        word.reposition_existing_tone(tone_style);
 
-        let new_rendered = self.render_buffer();
-        self.rendered = new_rendered.clone();
+        let new_rendered = word.render_buffer();
+        word.rendered = new_rendered.clone();
         Some(diff_words_to_output(&old_rendered, &new_rendered))
     }
 
-    fn process_backspace(&mut self) {
-        self.letters.pop();
-        self.rendered = self.render_buffer();
-        if self.letters.is_empty() {
-            self.disabled_for_word = false;
+    fn process_separator(&mut self, sep: char) {
+        if let Some(word) = self.active_word.take() {
+            if !word.letters.is_empty() {
+                self.push_history(HistoryEntry::Word(word));
+            }
         }
+        self.push_history(HistoryEntry::Separator(sep));
     }
 
-    fn reset(&mut self) {
-        self.letters.clear();
-        self.rendered.clear();
-        self.disabled_for_word = false;
+    fn process_backspace(&mut self) -> Option<Vec<OutputItem>> {
+        // Case A: active_word currently has characters.
+        if let Some(mut word) = self.active_word.take() {
+            let old_rendered = word.rendered.clone();
+            let mut expected_if_raw_bs = old_rendered.clone();
+            expected_if_raw_bs.pop();
+
+            word.letters.pop();
+
+            if word.letters.is_empty() {
+                // Active word is now empty; leave active_word = None WITHOUT popping history
+                // because the preceding separator is still on screen.
+                return None;
+            }
+
+            word.reposition_existing_tone(self.tone_style);
+            let new_rendered = word.render_buffer();
+            word.rendered = new_rendered.clone();
+            self.active_word = Some(word);
+
+            if new_rendered == expected_if_raw_bs {
+                return None;
+            }
+
+            return Some(diff_words_to_output(&old_rendered, &new_rendered));
+        }
+
+        // Case B: active_word is None — pop separator and restore preceding Word if directly underneath.
+        if let Some(HistoryEntry::Separator(_)) = self.history.pop_back() {
+            if matches!(self.history.back(), Some(HistoryEntry::Word(_))) {
+                if let Some(HistoryEntry::Word(restored)) = self.history.pop_back() {
+                    self.active_word = Some(restored);
+                }
+            }
+        }
+        None
+    }
+
+    fn clear_all(&mut self) {
+        self.active_word = None;
+        self.history.clear();
     }
 
     fn current_word(&self) -> &str {
-        &self.rendered
+        self.active_word
+            .as_ref()
+            .map(|w| w.rendered.as_str())
+            .unwrap_or("")
     }
 }
 
@@ -446,89 +541,264 @@ impl InputEngine for VniEngine {
 mod tests {
     use super::*;
 
+    fn apply_batch(screen: &mut Vec<char>, items: &[OutputItem]) {
+        for item in items {
+            match *item {
+                OutputItem::Backspace => {
+                    screen.pop();
+                }
+                OutputItem::VietnameseChar(c) | OutputItem::AsciiChar(c) => {
+                    screen.push(c);
+                }
+                OutputItem::PassThrough { .. } => {}
+            }
+        }
+    }
+
     fn simulate_typing(engine: &mut VniEngine, input: &str) -> String {
         let mut screen: Vec<char> = Vec::new();
         for ch in input.chars() {
             match engine.process_char(ch) {
-                Some(items) => {
-                    for item in items {
-                        match item {
-                            OutputItem::Backspace => {
-                                screen.pop();
-                            }
-                            OutputItem::VietnameseChar(c) | OutputItem::AsciiChar(c) => {
-                                screen.push(c);
-                            }
-                            OutputItem::PassThrough { .. } => {}
-                        }
-                    }
-                }
+                Some(items) => apply_batch(&mut screen, &items),
                 None => screen.push(ch),
             }
         }
         screen.into_iter().collect()
     }
 
+    fn sim_backspace(engine: &mut VniEngine, screen: &mut Vec<char>) -> Option<Vec<OutputItem>> {
+        let res = engine.process_backspace();
+        match &res {
+            Some(items) => apply_batch(screen, items),
+            None => {
+                screen.pop();
+            }
+        }
+        res
+    }
+
+    fn sim_char(engine: &mut VniEngine, screen: &mut Vec<char>, ch: char) -> Option<Vec<OutputItem>> {
+        let res = engine.process_char(ch);
+        match &res {
+            Some(items) => apply_batch(screen, items),
+            None => screen.push(ch),
+        }
+        res
+    }
+
     #[test]
     fn vni_vietnamese_words_and_tones() {
         let mut engine = VniEngine::new(ToneStyle::New);
         assert_eq!(simulate_typing(&mut engine, "tie6ng1 vie6t5"), "tiếng việt");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "tra6u"), "trâu");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "Tra6u"), "Trâu");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "d9u7o7c5"), "được");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "d9uo7c5"), "được");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "toa1n"), "toán");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "hoa2"), "hoà");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "thuy1"), "thuý");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "to6i10"), "tôi");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "na8m 2026"), "năm 2026");
     }
 
     #[test]
-    fn vni_old_tone_style() {
+    fn vni_old_tone_style_and_backspace_tone_reposition() {
         let mut engine = VniEngine::new(ToneStyle::Old);
         assert_eq!(simulate_typing(&mut engine, "hoa2"), "hòa");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "thuy1"), "thúy");
+        engine.clear_all();
+
+        let mut screen: Vec<char> = Vec::new();
+        for ch in "toan1".chars() {
+            sim_char(&mut engine, &mut screen, ch);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "toán");
+        let diff = sim_backspace(&mut engine, &mut screen);
+        assert_eq!(
+            diff,
+            Some(vec![
+                OutputItem::Backspace,
+                OutputItem::Backspace,
+                OutputItem::Backspace,
+                OutputItem::VietnameseChar('ó'),
+                OutputItem::AsciiChar('a'),
+            ])
+        );
+        assert_eq!(screen.iter().collect::<String>(), "tóa");
     }
 
     #[test]
     fn vni_standalone_numbers_non_applicable_digits_and_double_tap_undo() {
         let mut engine = VniEngine::new(ToneStyle::New);
-        // Standalone numbers pass straight through
         assert_eq!(simulate_typing(&mut engine, "1234567890"), "1234567890");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "2026"), "2026");
-        engine.reset();
-        // Non-applicable digits after consonants or without tone
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "b1"), "b1");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "t6"), "t6");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "k9"), "k9");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "a0"), "a0");
-        engine.reset();
-        // Double-tap undo cleanly restores base char and emits literal digit
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "a11"), "a1");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "a66"), "a6");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "u77"), "u7");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "a88"), "a8");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "d99"), "d9");
-        engine.reset();
+        engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "user1123"), "user123");
+    }
+
+    #[test]
+    fn vni_vowel_diacritic_overwrite_both_directions() {
+        let mut engine = VniEngine::new(ToneStyle::New);
+        assert_eq!(simulate_typing(&mut engine, "Na8ng6"), "Nâng");
+        engine.clear_all();
+        assert_eq!(simulate_typing(&mut engine, "Na6ng8"), "Năng");
+        engine.clear_all();
+        assert_eq!(simulate_typing(&mut engine, "buo7n6"), "buôn");
+        engine.clear_all();
+        assert_eq!(simulate_typing(&mut engine, "buo6n7"), "bươn");
+    }
+
+    #[test]
+    fn history_test_1_nang_space_bs_6_produces_nang_circumflex_with_minimal_diff() {
+        let mut engine = VniEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+
+        for ch in "Na8ng".chars() {
+            sim_char(&mut engine, &mut screen, ch);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "Năng");
+
+        sim_char(&mut engine, &mut screen, ' ');
+        assert_eq!(screen.iter().collect::<String>(), "Năng ");
+        assert_eq!(engine.history_len(), 2);
+
+        // Backspace deletes space and restores "Năng"
+        assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        assert_eq!(screen.iter().collect::<String>(), "Năng");
+        assert_eq!(engine.current_word(), "Năng");
+
+        // Typing '6' overwrites `ă` -> `â` with exact minimal diff: 3 BS + "âng"
+        let batch = sim_char(&mut engine, &mut screen, '6');
+        assert_eq!(
+            batch,
+            Some(vec![
+                OutputItem::Backspace,
+                OutputItem::Backspace,
+                OutputItem::Backspace,
+                OutputItem::VietnameseChar('â'),
+                OutputItem::AsciiChar('n'),
+                OutputItem::AsciiChar('g'),
+            ])
+        );
+        assert_eq!(screen.iter().collect::<String>(), "Nâng");
+    }
+
+    #[test]
+    fn history_test_2_double_space_single_bs_does_not_restore() {
+        let mut engine = VniEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+
+        for ch in "Na8ng  ".chars() {
+            sim_char(&mut engine, &mut screen, ch);
+        }
+        assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        assert_eq!(engine.current_word(), "");
+
+        // Typing 'a' starts a brand new word ("Năng a")
+        let batch = sim_char(&mut engine, &mut screen, 'a');
+        assert_eq!(batch, Some(vec![OutputItem::AsciiChar('a')]));
+        assert_eq!(screen.iter().collect::<String>(), "Năng a");
+    }
+
+    #[test]
+    fn history_test_3_double_space_double_bs_restores_word() {
+        let mut engine = VniEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+
+        for ch in "Na8ng  ".chars() {
+            sim_char(&mut engine, &mut screen, ch);
+        }
+        assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        assert_eq!(engine.current_word(), "");
+        assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        assert_eq!(engine.current_word(), "Năng");
+
+        sim_char(&mut engine, &mut screen, '6');
+        assert_eq!(screen.iter().collect::<String>(), "Nâng");
+    }
+
+    #[test]
+    fn history_test_4_delete_entire_second_word_and_space_restores_first_word() {
+        let mut engine = VniEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+
+        for ch in "To6i Na8ng".chars() {
+            sim_char(&mut engine, &mut screen, ch);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "Tôi Năng");
+
+        for _ in 0..4 {
+            assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "Tôi ");
+        assert_eq!(engine.current_word(), "");
+
+        assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        assert_eq!(screen.iter().collect::<String>(), "Tôi");
+        assert_eq!(engine.current_word(), "Tôi");
+
+        sim_char(&mut engine, &mut screen, '1');
+        assert_eq!(screen.iter().collect::<String>(), "Tối");
+    }
+
+    #[test]
+    fn history_test_5_clear_all_invalidates_history() {
+        let mut engine = VniEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+
+        for ch in "Na8ng ".chars() {
+            sim_char(&mut engine, &mut screen, ch);
+        }
+        assert_eq!(engine.history_len(), 2);
+
+        engine.clear_all();
+        assert_eq!(engine.history_len(), 0);
+
+        assert_eq!(sim_backspace(&mut engine, &mut screen), None);
+        // '6' must pass through verbatim (None) without modifying "Năng"
+        assert_eq!(sim_char(&mut engine, &mut screen, '6'), None);
+        assert_eq!(screen.iter().collect::<String>(), "Năng6");
+    }
+
+    #[test]
+    fn history_ring_buffer_respects_max_capacity() {
+        let mut engine = VniEngine::new(ToneStyle::New);
+        for i in 0..20 {
+            let word = if i % 2 == 0 { "an" } else { "em" };
+            for ch in word.chars() {
+                engine.process_char(ch);
+            }
+            engine.process_separator(' ');
+        }
+        assert_eq!(engine.history_len(), MAX_HISTORY_ENTRIES);
     }
 }

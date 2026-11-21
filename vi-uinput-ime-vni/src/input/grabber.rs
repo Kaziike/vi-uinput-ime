@@ -128,6 +128,7 @@ pub enum RouterEvent {
     RawKey { code: Key, value: i32 },
     MouseReset,
     WindowFocusChanged { app_class: String, is_xwayland: bool },
+    WorkspaceChanged,
 }
 
 /// Spawn an async reader task for a discovered keyboard (exclusive EVIOCGRAB)
@@ -200,7 +201,7 @@ pub fn spawn_device_reader(
                         Ok(ev) => {
                             if ev.event_type() == EventType::KEY && ev.value() == 1 {
                                 let key = Key::new(ev.code());
-                                if key == Key::BTN_LEFT || key == Key::BTN_RIGHT {
+                                if matches!(key, Key::BTN_LEFT | Key::BTN_RIGHT | Key::BTN_MIDDLE) {
                                     let _ = router_tx.send(RouterEvent::MouseReset);
                                 }
                             }
