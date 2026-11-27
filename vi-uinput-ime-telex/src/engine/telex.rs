@@ -271,14 +271,33 @@ impl SyllableState {
 
     /// Applies horn (`ơ`, `ư`, `ươ`) or breve (`ă`), allowing overwrite from `â`/`ô` (e.g. `Nâng`+`w` -> `Năng`).
     /// Does NOT turn standalone `w` into `ư`.
+    /// Priority order:
+    ///   1. `uo` cluster: `qu+o` -> `quơ`; `uo` with trailing coda/vowel -> `ươ`; open `uo` -> `uơ` (auto-expands on trailing char).
+    ///   2. `ua` cluster: non-`qu` `ua` -> `ưa` (`suawr` -> `sửa`); `qu+a` -> `quă` (`quawn` -> `quăn`).
+    ///   3. `oa` cluster: `o` stays plain, `a` -> `ă` (`hoawcj` -> `hoặc`, `xoawn` -> `xoăn`).
+    ///   4. Fallback reverse scan on single vowels `a`, `o`, `u`.
     fn apply_horn_or_breve(&mut self, tone_style: ToneStyle) -> bool {
         let len = self.letters.len();
 
+        // 1. `uo` cluster
         if len >= 2 {
             for i in (0..len - 1).rev() {
                 if self.letters[i].base == 'u' && self.letters[i + 1].base == 'o' {
                     let is_qu = i > 0 && self.letters[i - 1].base == 'q';
-                    if !is_qu {
+                    if is_qu {
+                        if self.letters[i + 1].shape == VowelShape::Horn {
+                            self.letters[i + 1].shape = VowelShape::Plain;
+                            self.reposition_existing_tone(tone_style);
+                            self.disabled_for_word = true;
+                            return false;
+                        }
+                        self.letters[i + 1].shape = VowelShape::Horn;
+                        self.reposition_existing_tone(tone_style);
+                        return true;
+                    }
+
+                    let has_trailing = i + 2 < len;
+                    if has_trailing {
                         if self.letters[i].shape == VowelShape::Horn
                             && self.letters[i + 1].shape == VowelShape::Horn
                         {
@@ -292,11 +311,74 @@ impl SyllableState {
                         self.letters[i + 1].shape = VowelShape::Horn;
                         self.reposition_existing_tone(tone_style);
                         return true;
+                    } else {
+                        // Open `uo` (e.g. `thuowr` -> `thuở`): horn `o` only; if a trailing
+                        // coda/vowel is typed later (e.g. `thuowng`), `process_char` auto-horns `u`.
+                        if self.letters[i + 1].shape == VowelShape::Horn {
+                            self.letters[i].shape = VowelShape::Plain;
+                            self.letters[i + 1].shape = VowelShape::Plain;
+                            self.reposition_existing_tone(tone_style);
+                            self.disabled_for_word = true;
+                            return false;
+                        }
+                        self.letters[i + 1].shape = VowelShape::Horn;
+                        self.reposition_existing_tone(tone_style);
+                        return true;
                     }
                 }
             }
         }
 
+        // 2. `ua` cluster (`suawr` -> `sửa`, `quawn` -> `quăn`)
+        if len >= 2 {
+            for i in (0..len - 1).rev() {
+                if self.letters[i].base == 'u' && self.letters[i + 1].base == 'a' {
+                    let is_qu = i > 0 && self.letters[i - 1].base == 'q';
+                    if is_qu {
+                        if self.letters[i + 1].shape == VowelShape::Breve {
+                            self.letters[i + 1].shape = VowelShape::Plain;
+                            self.reposition_existing_tone(tone_style);
+                            self.disabled_for_word = true;
+                            return false;
+                        }
+                        self.letters[i + 1].shape = VowelShape::Breve;
+                        self.reposition_existing_tone(tone_style);
+                        return true;
+                    } else {
+                        if self.letters[i].shape == VowelShape::Horn {
+                            self.letters[i].shape = VowelShape::Plain;
+                            self.reposition_existing_tone(tone_style);
+                            self.disabled_for_word = true;
+                            return false;
+                        }
+                        self.letters[i].shape = VowelShape::Horn;
+                        self.letters[i + 1].shape = VowelShape::Plain;
+                        self.reposition_existing_tone(tone_style);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // 3. `oa` cluster (`hoawcj` -> `hoặc`, `xoawn` -> `xoăn`)
+        if len >= 2 {
+            for i in (0..len - 1).rev() {
+                if self.letters[i].base == 'o' && self.letters[i + 1].base == 'a' {
+                    if self.letters[i + 1].shape == VowelShape::Breve {
+                        self.letters[i + 1].shape = VowelShape::Plain;
+                        self.reposition_existing_tone(tone_style);
+                        self.disabled_for_word = true;
+                        return false;
+                    }
+                    self.letters[i].shape = VowelShape::Plain;
+                    self.letters[i + 1].shape = VowelShape::Breve;
+                    self.reposition_existing_tone(tone_style);
+                    return true;
+                }
+            }
+        }
+
+        // 4. Single-vowel fallback
         for i in (0..len).rev() {
             match self.letters[i].base {
                 'a' => {
@@ -422,13 +504,25 @@ impl InputEngine for TelexEngine {
         if !transformed {
             word.letters.push(Letter::from_ascii(c));
             let len = word.letters.len();
-            if len >= 3
-                && word.letters[len - 3].base == 'u'
-                && word.letters[len - 3].shape == VowelShape::Horn
-                && word.letters[len - 2].base == 'o'
-                && word.letters[len - 2].shape == VowelShape::Plain
-            {
-                word.letters[len - 2].shape = VowelShape::Horn;
+            if len >= 3 {
+                // Auto-expand `ưo + trailing` -> `ươ + trailing` (e.g. `dduwocj` -> `được`)
+                if word.letters[len - 3].base == 'u'
+                    && word.letters[len - 3].shape == VowelShape::Horn
+                    && word.letters[len - 2].base == 'o'
+                    && word.letters[len - 2].shape == VowelShape::Plain
+                {
+                    word.letters[len - 2].shape = VowelShape::Horn;
+                }
+                // Auto-expand non-`qu` `uơ + trailing` -> `ươ + trailing` (e.g. `thuowng` -> `thương`, `nuowcs` -> `nước`, `tuowi` -> `tươi`)
+                let is_qu = len >= 4 && word.letters[len - 4].base == 'q';
+                if !is_qu
+                    && word.letters[len - 3].base == 'u'
+                    && word.letters[len - 3].shape == VowelShape::Plain
+                    && word.letters[len - 2].base == 'o'
+                    && word.letters[len - 2].shape == VowelShape::Horn
+                {
+                    word.letters[len - 3].shape = VowelShape::Horn;
+                }
             }
             word.reposition_existing_tone(tone_style);
         }
@@ -513,7 +607,7 @@ mod tests {
                 OutputItem::VietnameseChar(c) | OutputItem::AsciiChar(c) => {
                     screen.push(c);
                 }
-                OutputItem::PassThrough { .. } => {}
+                OutputItem::PassThrough { .. } | OutputItem::SyncCapsLock(_) => {}
             }
         }
     }
@@ -803,5 +897,57 @@ mod tests {
             engine.process_separator(' ');
         }
         assert_eq!(engine.history_len(), MAX_HISTORY_ENTRIES);
+    }
+
+    #[test]
+    fn telex_w_clusters_ua_qua_oa_uo_and_undo() {
+        let cases = [
+            // `ua` + `w` in every tone order -> `ưa`
+            ("suawr", "sửa"),
+            ("suarw", "sửa"),
+            ("suwar", "sửa"),
+            ("suwra", "sửa"),
+            ("cuawr", "cửa"),
+            ("luawr", "lửa"),
+            ("muaw", "mưa"),
+            ("nuawr", "nửa"),
+            ("chuaw", "chưa"),
+            ("dduaw", "đưa"),
+            ("nguawj", "ngựa"),
+            ("ruawr", "rửa"),
+            ("thuaw", "thưa"),
+            ("truaw", "trưa"),
+            ("vuawf", "vừa"),
+            ("xuaw", "xưa"),
+            // Double-tap `w` on `ưa` undoes horn and appends literal 'w'
+            ("suaww", "suaw"),
+            // `qu` + `a` + `w` -> `quă`
+            ("quawn", "quăn"),
+            ("quawng", "quăng"),
+            ("quawtj", "quặt"),
+            // `oa` + `w` -> `oă`
+            ("hoawcj", "hoặc"),
+            ("xoawn", "xoăn"),
+            // `uo` + `w`: quow, open uo, closed/triphthong uo
+            ("quowr", "quở"),
+            ("thuowr", "thuở"),
+            ("thuowng", "thương"),
+            ("nuowcs", "nước"),
+            ("nuocws", "nước"),
+            ("tuowi", "tươi"),
+            ("tuoiw", "tươi"),
+            ("dduowcj", "được"),
+            ("dduocwj", "được"),
+        ];
+
+        for (raw, expected) in cases {
+            let mut engine = TelexEngine::new(ToneStyle::New);
+            let mut screen: Vec<char> = Vec::new();
+            for ch in raw.chars() {
+                sim_char(&mut engine, &mut screen, ch);
+            }
+            let got: String = screen.into_iter().collect();
+            assert_eq!(got, expected, "Telex input '{}' failed", raw);
+        }
     }
 }

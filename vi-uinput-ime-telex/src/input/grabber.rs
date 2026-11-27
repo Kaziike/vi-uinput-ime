@@ -1,6 +1,6 @@
 use crate::input::scanner::{DeviceKind, DiscoveredDevice};
 use anyhow::{Context, Result};
-use evdev::{Device, EventType, Key};
+use evdev::{Device, EventType, Key, LedType};
 use std::collections::HashSet;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::{Mutex, OnceLock};
@@ -84,6 +84,17 @@ impl GrabbedKeyboardGuard {
         })
     }
 
+    /// Query the physical keyboard's current `LED_CAPSL` state via evdev `EVIOCGLED`.
+    pub fn caps_lock_led_state(&self) -> Option<bool> {
+        match self.device.get_led_state() {
+            Ok(leds) => Some(leds.contains(LedType::LED_CAPSL)),
+            Err(err) => {
+                warn!("Cannot query LED_CAPSL state on '{}': {}", self.name, err);
+                None
+            }
+        }
+    }
+
     pub fn into_event_stream(self) -> Result<(evdev::EventStream, FdUngrabToken)> {
         let raw_fd = self.raw_fd;
         let name = self.name.clone();
@@ -123,12 +134,18 @@ impl Drop for FdUngrabToken {
 
 /// High-level events sent from grabbed keyboards, read-only mice, and compositor IPC
 /// to the central Event Router & Context Manager.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouterEvent {
     RawKey { code: Key, value: i32 },
+    /// Initial hardware CapsLock LED state read from `evdev::Device::get_led_state()`.
+    CapsLockSync(bool),
     MouseReset,
     WindowFocusChanged { app_class: String, is_xwayland: bool },
     WorkspaceChanged,
+    /// Desktop active layout/IME state (`active = true` ONLY when `vi_uinput` is active).
+    LayoutStateChanged { active: bool, layout_id: String },
+    /// Emitted internally when the last user-session `--ipc-bridge` client disconnects.
+    IpcBridgeDisconnected,
 }
 
 /// Spawn an async reader task for a discovered keyboard (exclusive EVIOCGRAB)
@@ -147,6 +164,16 @@ pub fn spawn_device_reader(
                         return;
                     }
                 };
+
+                if let Some(caps_on) = guard.caps_lock_led_state() {
+                    info!(
+                        "Synced initial hardware CapsLock LED from '{}': {}",
+                        dev.name,
+                        if caps_on { "ON" } else { "OFF" }
+                    );
+                    let _ = router_tx.send(RouterEvent::CapsLockSync(caps_on));
+                }
+
                 let (mut stream, _ungrab_token) = match guard.into_event_stream() {
                     Ok(pair) => pair,
                     Err(err) => {

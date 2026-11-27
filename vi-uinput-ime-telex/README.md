@@ -35,25 +35,43 @@ sudo install -Dm644 deploy/vi-uinput-ime-telex.service /etc/systemd/system/vi-ui
 sudo systemctl daemon-reload
 sudo systemctl disable --now vi-uinput-ime-vni.service 2>/dev/null || true
 sudo systemctl enable --now vi-uinput-ime-telex.service
+
+# Cài cầu nối đồng bộ Layout Desktop & Compositor IPC (BẮT BUỘC cho tự động tạm dừng khi chuyển sang US/IBus/Fcitx5 trên GNOME/KDE)
+install -Dm644 deploy/vi-uinput-ime-telex-ipc.service ~/.config/systemd/user/vi-uinput-ime-telex-ipc.service
+systemctl --user daemon-reload
+systemctl --user enable --now vi-uinput-ime-telex-ipc.service
 ```
 
-## 3. Kích hoạt layout XKB 134 ký tự (`vi_uinput`)
+## 3. Kích hoạt layout XKB 134 ký tự (`vi_uinput`, miễn nhiễm CapsLock ở Level 5–8)
 
-### GNOME / Mutter Wayland
+### GNOME / Mutter Wayland (song song với US / IBus / Fcitx5)
 ```bash
 /usr/local/bin/vi-uinput-ime-telex --install-gnome-xkb
 gsettings set org.gnome.desktop.input-sources show-all-sources true
-gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'vi_uinput')]"
+# Khai báo cả US và vi_uinput; khi chuyển sang US/IBus daemon tự tạm dừng về PassThrough:
+gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'us'), ('xkb', 'vi_uinput')]"
+# Khuyến nghị giữ nguồn nhập dùng chung cho mọi cửa sổ để mru-sources luôn đồng bộ:
+gsettings set org.gnome.desktop.input-sources per-window false
 ```
 
-### KDE Plasma 6 / KWin Wayland
+### KDE Plasma / KWin Wayland (song song với US / Fcitx5)
 ```bash
 /usr/local/bin/vi-uinput-ime-telex --install-gnome-xkb
 kwriteconfig6 --file kxkbrc --group Layout --key Use true
-kwriteconfig6 --file kxkbrc --group Layout --key LayoutList vi_uinput
+kwriteconfig6 --file kxkbrc --group Layout --key LayoutList us,vi_uinput
 ```
 
-### Hyprland / Sway / X11
-- **Hyprland:** `device { name = vi-uinput-virtual-kbd; kb_file = /etc/vi-uinput-ime/vn_virtual.xkb; }`
+### KDE Plasma X11 (Xorg — hỗ trợ đồng thời cài native `/usr/share/X11/xkb` & tự phục hồi `xkbcomp`)
+```bash
+# Cài native vào /usr/share/X11/xkb (symbols/vi_uinput + types/vi_uinput + patch types/complete & rules/evdev.{xml,lst})
+sudo /usr/local/bin/vi-uinput-ime-telex --install-x11-xkb
+# (Gỡ sạch mọi thay đổi trong /usr/share/X11/xkb bất cứ lúc nào bằng: sudo /usr/local/bin/vi-uinput-ime-telex --uninstall-x11-xkb)
+
+# Đảm bảo user-session IPC bridge đang chạy để tự phục hồi keymap qua xkbcomp khi Xorg reset Virtual Core Keyboard / hotplug uinput
+systemctl --user restart vi-uinput-ime-telex-ipc.service
+```
+
+### Hyprland / Sway / X11 thuần
+- **Hyprland:** `device { name = vi-uinput-virtual-kbd; kb_file = /etc/vi-uinput-ime/vn_virtual.xkb; }` *(có thể đặt `toggle = "ctrl+space"` trong `config.toml` nếu không dùng bộ chuyển layout của GNOME/KDE)*
 - **Sway:** `input "4617:1:vi-uinput-virtual-kbd" { xkb_file /etc/vi-uinput-ime/vn_virtual.xkb }`
-- **X11:** `xkbcomp -i "$(xinput list --id-only 'vi-uinput-virtual-kbd')" /etc/vi-uinput-ime/vn_virtual.xkb "$DISPLAY"`
+- **X11 thuần (không có KDE):** dùng `--install-x11-xkb` hoặc để `--ipc-bridge` tự nạp/phục hồi bằng `xkbcomp`.

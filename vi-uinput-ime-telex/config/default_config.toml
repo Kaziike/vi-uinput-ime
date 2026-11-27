@@ -4,16 +4,25 @@
 [general]
 # Tone placement style: "new" (oà, uý) or "old" (òa, úy)
 tone_style = "new"
-# Enable Vietnamese Telex input on startup
+# Enable Vietnamese Telex input when desktop layout `vi_uinput` is active
 enabled_on_start = true
+# Auto-pause to 100% PassThrough whenever GNOME/KDE switches away from `vi_uinput` (to US, IBus, Fcitx5...)
+sync_desktop_layout = true
 # Path to write current IME state ("VI" / "EN") for Waybar / Polybar / eww
 state_file = "/run/vi-uinput-ime-telex/state"
 # Path where custom XKB keymap is installed
 xkb_keymap_path = "/etc/vi-uinput-ime/vn_virtual.xkb"
+# UNIX socket path used by `--ipc-bridge` (user session -> systemd daemon)
+ipc_socket_path = "/run/vi-uinput-ime-telex/ipc.sock"
+# Optional keyboard include/exclude filters (substring match against device name or /dev/input/by-id/*)
+device_include = []
+device_exclude = []
 
 [hotkey]
-# Toggle shortcut: "ctrl+space" or "super+space"
-toggle = "ctrl+space"
+# Toggle shortcut:
+# - "none" (recommended on GNOME/KDE): use desktop input-source switcher (Super+Space / Meta+Space) with zero IBus/Fcitx5 conflict
+# - "ctrl+space" or "super+space": manual daemon toggle (useful on Hyprland/Sway standalone)
+toggle = "none"
 
 [delays]
 # Fallback delay (ms) between synthetic uinput keystrokes when app is unknown

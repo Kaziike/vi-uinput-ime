@@ -13,7 +13,7 @@ use input::emitter::{spawn_fifo_emitter, OutputItem, UinputSink};
 use input::grabber::{
     emergency_ungrab_all, install_failsafe_panic_hook, spawn_device_reader, RouterEvent,
 };
-use input::scanner::spawn_hotplug_scanner;
+use input::scanner::{spawn_hotplug_scanner, DeviceFilter};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -131,7 +131,9 @@ fn key_to_telex_char(code: Key, shift: bool, caps_lock: bool) -> Option<char> {
 struct TelexRouter {
     engine: TelexEngine,
     mods: ModifierState,
-    ime_enabled: bool,
+    manual_enabled: bool,
+    desktop_layout_active: bool,
+    sync_desktop_layout: bool,
     toggle_hotkey: ToggleHotkey,
     /// Tracks every non-modifier key whose `value == 1` press was forwarded as `PassThrough`,
     /// guaranteeing its matching repeat (`value == 2`) and release (`value == 0`) are NEVER swallowed.
@@ -139,18 +141,52 @@ struct TelexRouter {
 }
 
 impl TelexRouter {
-    fn new(tone_style: config::ToneStyle, ime_enabled: bool, toggle_hotkey: ToggleHotkey) -> Self {
+    fn new(tone_style: config::ToneStyle, manual_enabled: bool, toggle_hotkey: ToggleHotkey) -> Self {
         Self {
             engine: TelexEngine::new(tone_style),
             mods: ModifierState::default(),
-            ime_enabled,
+            manual_enabled,
+            desktop_layout_active: true,
+            sync_desktop_layout: false,
             toggle_hotkey,
             passthrough_held: HashSet::new(),
         }
     }
 
+    fn with_desktop_layout_sync(mut self, sync: bool) -> Self {
+        self.sync_desktop_layout = sync;
+        if sync && self.toggle_hotkey == ToggleHotkey::None {
+            // Fail-safe PassThrough until user-session `--ipc-bridge` confirms `vi_uinput` is active
+            self.desktop_layout_active = false;
+        }
+        self
+    }
+
+    fn effective_enabled(&self) -> bool {
+        self.manual_enabled && self.desktop_layout_active
+    }
+
+    fn set_desktop_layout_active(&mut self, active: bool) -> bool {
+        self.desktop_layout_active = active;
+        self.engine.clear_all();
+        self.effective_enabled()
+    }
+
+    fn on_ipc_bridge_disconnected(&mut self) -> Option<bool> {
+        if self.sync_desktop_layout && self.toggle_hotkey == ToggleHotkey::None {
+            self.desktop_layout_active = false;
+            self.engine.clear_all();
+            return Some(self.effective_enabled());
+        }
+        None
+    }
+
     fn clear_all(&mut self) {
         self.engine.clear_all();
+    }
+
+    fn sync_caps_lock(&mut self, on: bool) {
+        self.mods.caps_lock = on;
     }
 
     fn handle_raw_key(&mut self, code: Key, value: i32) -> (Vec<OutputItem>, Option<bool>) {
@@ -176,10 +212,11 @@ impl TelexRouter {
             return (vec![OutputItem::PassThrough { code, value: 2 }], None);
         }
 
-        // 4. IME toggle hotkey (`Ctrl+Space` or `Super+Space`)
+        // 4. IME toggle hotkey (`none`, `Ctrl+Space`, or `Super+Space`)
         let toggle_hit = code == Key::KEY_SPACE
             && value == 1
             && match self.toggle_hotkey {
+                ToggleHotkey::None => false,
                 ToggleHotkey::CtrlSpace => {
                     self.mods.ctrl() && !self.mods.alt() && !self.mods.super_key()
                 }
@@ -188,14 +225,30 @@ impl TelexRouter {
                 }
             };
         if toggle_hit {
-            self.ime_enabled = !self.ime_enabled;
+            self.manual_enabled = !self.manual_enabled;
             self.engine.clear_all();
-            return (Vec::new(), Some(self.ime_enabled));
+            let suppress = if self.mods.super_key() || self.mods.alt() {
+                // Inject a harmless non-modifier key tap (KEY_F24) so Mutter/KWin observes
+                // `Super down -> F24 down -> F24 up -> Super up` and cancels Overview/Launcher.
+                vec![
+                    OutputItem::PassThrough {
+                        code: Key::KEY_F24,
+                        value: 1,
+                    },
+                    OutputItem::PassThrough {
+                        code: Key::KEY_F24,
+                        value: 0,
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            return (suppress, Some(self.effective_enabled()));
         }
 
-        // 5. Strict invalidation & PassThrough when IME disabled, Ctrl/Alt/Super held (e.g. Ctrl+Backspace),
-        //    or navigation / linear-flow-breaking key pressed.
-        if !self.ime_enabled || self.mods.any_shortcut_modifier() || is_context_reset_key(code) {
+        // 5. Strict invalidation & PassThrough when IME disabled/paused, Ctrl/Alt/Super held
+        //    (e.g. Ctrl+Backspace, Ctrl+Space, Super+Space), or navigation key pressed.
+        if !self.effective_enabled() || self.mods.any_shortcut_modifier() || is_context_reset_key(code) {
             if value == 1 || value == 2 {
                 self.engine.clear_all();
             }
@@ -309,16 +362,38 @@ async fn main() -> Result<()> {
                 .join("xkb")
         };
         let symbols_dir = base_dir.join("symbols");
+        let types_dir = base_dir.join("types");
         let rules_dir = base_dir.join("rules");
         fs::create_dir_all(&symbols_dir)?;
+        fs::create_dir_all(&types_dir)?;
         fs::create_dir_all(&rules_dir)?;
         let sym_path = symbols_dir.join("vi_uinput");
+        let types_path = types_dir.join("complete");
         let xml_path = rules_dir.join("evdev.xml");
         fs::write(&sym_path, xkb_gen::generate_gnome_xkb_symbols())?;
+        fs::write(&types_path, xkb_gen::generate_gnome_xkb_types())?;
         fs::write(&xml_path, xkb_gen::generate_gnome_evdev_xml())?;
-        info!("Installed GNOME/KDE XKB RMLVO layout:");
+        info!("Installed GNOME/KDE XKB RMLVO layout (with CapsLock-immune Levels 5-8):");
         info!("  {}", sym_path.display());
+        info!("  {}", types_path.display());
         info!("  {}", xml_path.display());
+        return Ok(());
+    }
+
+    if args.iter().any(|a| a == "--install-x11-xkb") {
+        let root_dir = std::path::Path::new("/usr/share/X11/xkb");
+        xkb_gen::install_x11_system_xkb(root_dir)?;
+        info!("Installed native X11 / Xorg XKB layout into {}:", root_dir.display());
+        info!("  {}/symbols/vi_uinput (multi-group safe)", root_dir.display());
+        info!("  {}/types/vi_uinput + patched types/complete", root_dir.display());
+        info!("  Registered `vi_uinput` in rules/evdev.xml & rules/evdev.lst");
+        return Ok(());
+    }
+
+    if args.iter().any(|a| a == "--uninstall-x11-xkb") {
+        let root_dir = std::path::Path::new("/usr/share/X11/xkb");
+        xkb_gen::uninstall_x11_system_xkb(root_dir)?;
+        info!("Removed native X11 / Xorg XKB layout and reverted patches in {}", root_dir.display());
         return Ok(());
     }
 
@@ -329,14 +404,25 @@ async fn main() -> Result<()> {
         AppConfig::default()
     };
 
-    write_state_file(&config.general.state_file, config.general.enabled_on_start);
+    if args.iter().any(|a| a == "--ipc-bridge") {
+        let socket_path = if let Some(pos) = args.iter().position(|a| a == "--ipc-socket") {
+            PathBuf::from(args.get(pos + 1).expect("missing path after --ipc-socket"))
+        } else {
+            PathBuf::from(&config.general.ipc_socket_path)
+        };
+        return ipc::bridge::run_ipc_bridge(socket_path).await;
+    }
 
     let sink = UinputSink::create()?;
     let (emitter, _emitter_task) = spawn_fifo_emitter(sink, config.delays.default_ms);
 
     let (router_tx, mut router_rx) = mpsc::unbounded_channel::<RouterEvent>();
     let (dev_tx, mut dev_rx) = mpsc::unbounded_channel();
-    spawn_hotplug_scanner(dev_tx)?;
+    let device_filter = DeviceFilter::new(
+        config.general.device_include.clone(),
+        config.general.device_exclude.clone(),
+    );
+    spawn_hotplug_scanner(dev_tx, device_filter)?;
 
     let device_router_tx = router_tx.clone();
     tokio::spawn(async move {
@@ -345,6 +431,21 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Listen for desktop user-session `--ipc-bridge` events over UNIX socket
+    let ipc_socket_path = PathBuf::from(&config.general.ipc_socket_path);
+    let _ipc_server = match ipc::bridge::spawn_ipc_server(&ipc_socket_path, router_tx.clone()) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            warn!(
+                "Could not bind IPC bridge UNIX socket '{}': {:#} (continuing with direct IPC fallback)",
+                ipc_socket_path.display(),
+                err
+            );
+            None
+        }
+    };
+
+    // Direct IPC fallback when daemon is launched manually inside a desktop session terminal
     ipc::spawn_active_window_monitor(router_tx.clone());
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -352,11 +453,19 @@ async fn main() -> Result<()> {
         config.general.tone_style,
         config.general.enabled_on_start,
         config.hotkey.toggle,
-    );
+    )
+    .with_desktop_layout_sync(config.general.sync_desktop_layout);
+
+    write_state_file(&config.general.state_file, router.effective_enabled());
 
     info!(
-        "vi-uinput-ime-telex started (tone={:?}, enabled={}, default_delay={}ms)",
-        config.general.tone_style, config.general.enabled_on_start, config.delays.default_ms
+        "vi-uinput-ime-telex started (tone={:?}, toggle={:?}, sync_desktop_layout={}, active={}, default_delay={}ms, ipc_socket={})",
+        config.general.tone_style,
+        config.hotkey.toggle,
+        config.general.sync_desktop_layout,
+        router.effective_enabled(),
+        config.delays.default_ms,
+        config.general.ipc_socket_path
     );
 
     loop {
@@ -364,15 +473,38 @@ async fn main() -> Result<()> {
             _ = tokio::signal::ctrl_c() => {
                 info!("Received SIGINT — releasing all grabbed keyboards and exiting.");
                 emergency_ungrab_all();
+                let _ = fs::remove_file(&ipc_socket_path);
                 break;
             }
             _ = sigterm.recv() => {
                 info!("Received SIGTERM — releasing all grabbed keyboards and exiting.");
                 emergency_ungrab_all();
+                let _ = fs::remove_file(&ipc_socket_path);
                 break;
             }
             Some(event) = router_rx.recv() => {
                 match event {
+                    RouterEvent::CapsLockSync(on) => {
+                        router.sync_caps_lock(on);
+                        emitter.enqueue(OutputItem::SyncCapsLock(on));
+                    }
+                    RouterEvent::LayoutStateChanged { active, layout_id } => {
+                        if config.general.sync_desktop_layout {
+                            let eff = router.set_desktop_layout_active(active);
+                            write_state_file(&config.general.state_file, eff);
+                            info!(
+                                "Desktop layout '{}' -> Telex IME {}",
+                                layout_id,
+                                if eff { "ACTIVE (VI)" } else { "PAUSED (PassThrough)" }
+                            );
+                        }
+                    }
+                    RouterEvent::IpcBridgeDisconnected => {
+                        if let Some(eff) = router.on_ipc_bridge_disconnected() {
+                            write_state_file(&config.general.state_file, eff);
+                            info!("IPC bridge disconnected -> Telex IME auto-paused (PassThrough)");
+                        }
+                    }
                     RouterEvent::MouseReset | RouterEvent::WorkspaceChanged => {
                         router.clear_all();
                     }
@@ -410,6 +542,7 @@ mod tests {
     ) {
         for item in items {
             match *item {
+                OutputItem::SyncCapsLock(_) => {}
                 OutputItem::Backspace => {
                     screen.pop();
                 }
@@ -549,6 +682,162 @@ mod tests {
         let (items, _) = router.handle_raw_key(Key::KEY_LEFTCTRL, 0);
         apply_router_output(&mut screen, &mut held, &items);
         assert_eq!(router.engine.history_len(), 0);
+
+        assert!(held.is_empty(), "Stuck virtual keys: {:?}", held);
+        assert!(router.passthrough_held.is_empty());
+    }
+
+    #[test]
+    fn super_space_toggles_ime_swallows_space_and_emits_f24_tap() {
+        let mut router = TelexRouter::new(config::ToneStyle::New, true, ToggleHotkey::SuperSpace);
+        let mut screen: Vec<char> = Vec::new();
+        let mut held: HashSet<Key> = HashSet::new();
+
+        // Hold Super (KEY_LEFTMETA)
+        let (meta_down, toggled) = router.handle_raw_key(Key::KEY_LEFTMETA, 1);
+        assert_eq!(toggled, None);
+        assert_eq!(
+            meta_down,
+            vec![OutputItem::PassThrough {
+                code: Key::KEY_LEFTMETA,
+                value: 1,
+            }]
+        );
+        apply_router_output(&mut screen, &mut held, &meta_down);
+
+        // Press Space while Super is held -> toggles IME OFF, swallows Space, emits KEY_F24 tap
+        let (space_down, toggled) = router.handle_raw_key(Key::KEY_SPACE, 1);
+        assert_eq!(toggled, Some(false));
+        assert!(!router.effective_enabled());
+        assert_eq!(
+            space_down,
+            vec![
+                OutputItem::PassThrough {
+                    code: Key::KEY_F24,
+                    value: 1,
+                },
+                OutputItem::PassThrough {
+                    code: Key::KEY_F24,
+                    value: 0,
+                },
+            ]
+        );
+        apply_router_output(&mut screen, &mut held, &space_down);
+
+        // Release Space -> swallowed cleanly (no stray Space release)
+        let (space_up, toggled) = router.handle_raw_key(Key::KEY_SPACE, 0);
+        assert_eq!(toggled, None);
+        assert!(space_up.is_empty());
+
+        // Release Super -> passed through cleanly
+        let (meta_up, toggled) = router.handle_raw_key(Key::KEY_LEFTMETA, 0);
+        assert_eq!(toggled, None);
+        assert_eq!(
+            meta_up,
+            vec![OutputItem::PassThrough {
+                code: Key::KEY_LEFTMETA,
+                value: 0,
+            }]
+        );
+        apply_router_output(&mut screen, &mut held, &meta_up);
+
+        assert!(screen.is_empty(), "Space must be swallowed, got {:?}", screen);
+        assert!(held.is_empty(), "Stuck virtual keys: {:?}", held);
+        assert!(router.passthrough_held.is_empty());
+
+        // Toggle back ON with Ctrl+Space router -> must NOT emit KEY_F24
+        let mut ctrl_router =
+            TelexRouter::new(config::ToneStyle::New, true, ToggleHotkey::CtrlSpace);
+        ctrl_router.handle_raw_key(Key::KEY_LEFTCTRL, 1);
+        let (ctrl_space_down, toggled) = ctrl_router.handle_raw_key(Key::KEY_SPACE, 1);
+        assert_eq!(toggled, Some(false));
+        assert!(ctrl_space_down.is_empty());
+    }
+
+    #[test]
+    fn desktop_layout_sync_pauses_to_passthrough_and_toggle_none_never_swallows_shortcuts() {
+        let mut router = TelexRouter::new(config::ToneStyle::New, true, ToggleHotkey::None)
+            .with_desktop_layout_sync(true);
+        let mut screen: Vec<char> = Vec::new();
+        let mut held: HashSet<Key> = HashSet::new();
+
+        // Fail-safe: starts paused until desktop bridge reports `vi_uinput` is active
+        assert!(!router.effective_enabled());
+
+        // ToggleHotkey::None must pass BOTH Super+Space (GNOME) and Ctrl+Space (IBus/Fcitx5)
+        // straight through verbatim (NO swallowed Space, NO KEY_F24)
+        for modifier in [Key::KEY_LEFTMETA, Key::KEY_LEFTCTRL] {
+            let (m_down, t1) = router.handle_raw_key(modifier, 1);
+            assert_eq!(t1, None);
+            apply_router_output(&mut screen, &mut held, &m_down);
+
+            let (sp_down, t2) = router.handle_raw_key(Key::KEY_SPACE, 1);
+            assert_eq!(t2, None);
+            assert_eq!(
+                sp_down,
+                vec![OutputItem::PassThrough {
+                    code: Key::KEY_SPACE,
+                    value: 1,
+                }]
+            );
+            apply_router_output(&mut screen, &mut held, &sp_down);
+
+            let (sp_up, _) = router.handle_raw_key(Key::KEY_SPACE, 0);
+            assert_eq!(
+                sp_up,
+                vec![OutputItem::PassThrough {
+                    code: Key::KEY_SPACE,
+                    value: 0,
+                }]
+            );
+            apply_router_output(&mut screen, &mut held, &sp_up);
+
+            let (m_up, _) = router.handle_raw_key(modifier, 0);
+            apply_router_output(&mut screen, &mut held, &m_up);
+        }
+        assert!(!router.effective_enabled());
+        screen.clear();
+
+        // When paused (e.g. GNOME US layout), typing `t e s t` emits ONLY raw PassThrough
+        for k in [Key::KEY_T, Key::KEY_E, Key::KEY_S, Key::KEY_T] {
+            let (down, _) = router.handle_raw_key(k, 1);
+            assert_eq!(down, vec![OutputItem::PassThrough { code: k, value: 1 }]);
+            apply_router_output(&mut screen, &mut held, &down);
+            let (up, _) = router.handle_raw_key(k, 0);
+            assert_eq!(up, vec![OutputItem::PassThrough { code: k, value: 0 }]);
+            apply_router_output(&mut screen, &mut held, &up);
+        }
+
+        // Desktop switches to `vi_uinput` -> Telex activates immediately (`suawr` -> "sửa")
+        assert!(router.set_desktop_layout_active(true));
+        for k in [Key::KEY_S, Key::KEY_U, Key::KEY_A, Key::KEY_W, Key::KEY_R] {
+            tap_key(&mut router, &mut screen, &mut held, k);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "sửa");
+
+        // Desktop switches back to `us` or `ibus:Bamboo` -> clears word buffer & auto-pauses
+        assert!(!router.set_desktop_layout_active(false));
+        let (down, _) = router.handle_raw_key(Key::KEY_N, 1);
+        assert_eq!(
+            down,
+            vec![OutputItem::PassThrough {
+                code: Key::KEY_N,
+                value: 1
+            }]
+        );
+        let (up, _) = router.handle_raw_key(Key::KEY_N, 0);
+        assert_eq!(
+            up,
+            vec![OutputItem::PassThrough {
+                code: Key::KEY_N,
+                value: 0
+            }]
+        );
+
+        // Desktop switches to `vi_uinput`, then user logs out (IPC bridge disconnects) -> auto-pauses
+        assert!(router.set_desktop_layout_active(true));
+        assert_eq!(router.on_ipc_bridge_disconnected(), Some(false));
+        assert!(!router.effective_enabled());
 
         assert!(held.is_empty(), "Stuck virtual keys: {:?}", held);
         assert!(router.passthrough_held.is_empty());

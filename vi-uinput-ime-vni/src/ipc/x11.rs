@@ -7,15 +7,36 @@ pub struct X11Monitor;
 
 impl WindowMonitor for X11Monitor {
     fn name(&self) -> &'static str {
-        "X11 Root PropertyNotify (_NET_ACTIVE_WINDOW)"
+        "X11 Root PropertyNotify (_NET_ACTIVE_WINDOW) + MappingNotify (XKB Self-Heal)"
     }
 
     fn spawn(self: Box<Self>, router_tx: mpsc::UnboundedSender<RouterEvent>) {
         #[cfg(feature = "x11")]
         {
+            // Async debounced self-heal task triggered whenever Xorg emits MappingNotify(KEYBOARD)
+            // (e.g. Virtual Core Keyboard reset, setxkbmap override, or `vi-uinput-virtual-kbd` hotplug).
+            let (heal_tx, mut heal_rx) = mpsc::unbounded_channel::<()>();
+            tokio::spawn(async move {
+                while heal_rx.recv().await.is_some() {
+                    // Debounce bursts of Xorg MappingNotify events (150ms settle)
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    while heal_rx.try_recv().is_ok() {}
+
+                    if let Some((layouts, active_idx)) = crate::ipc::kde::query_current_kde_state().await {
+                        crate::ipc::x11_xkb::ensure_x11_vi_uinput_keymap(
+                            Some(&layouts),
+                            Some(active_idx),
+                        )
+                        .await;
+                    } else {
+                        crate::ipc::x11_xkb::ensure_x11_vi_uinput_keymap(None, None).await;
+                    }
+                }
+            });
+
             std::thread::spawn(move || {
-                if let Err(err) = run_x11_loop(router_tx) {
-                    warn!("X11 window monitor stopped: {:#}", err);
+                if let Err(err) = run_x11_loop(router_tx, heal_tx) {
+                    warn!("X11 window/keymap monitor stopped: {:#}", err);
                 }
             });
         }
@@ -29,7 +50,10 @@ impl WindowMonitor for X11Monitor {
 }
 
 #[cfg(feature = "x11")]
-fn run_x11_loop(router_tx: mpsc::UnboundedSender<RouterEvent>) -> anyhow::Result<()> {
+fn run_x11_loop(
+    router_tx: mpsc::UnboundedSender<RouterEvent>,
+    heal_tx: mpsc::UnboundedSender<()>,
+) -> anyhow::Result<()> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::*;
     use x11rb::protocol::Event;
@@ -48,38 +72,47 @@ fn run_x11_loop(router_tx: mpsc::UnboundedSender<RouterEvent>) -> anyhow::Result
 
     loop {
         let event = conn.wait_for_event()?;
-        if let Event::PropertyNotify(prop) = event {
-            if prop.atom != net_active {
-                continue;
+        match event {
+            Event::MappingNotify(mapping) => {
+                if mapping.request == Mapping::KEYBOARD {
+                    debug!("X11 MappingNotify(KEYBOARD) received — scheduling XKB health check");
+                    let _ = heal_tx.send(());
+                }
             }
-            let reply = conn
-                .get_property(false, root, net_active, AtomEnum::WINDOW, 0, 1)?
-                .reply()?;
-            let Some(win_id) = reply.value32().and_then(|mut it| it.next()) else {
-                continue;
-            };
-            if win_id == 0 {
-                continue;
+            Event::PropertyNotify(prop) => {
+                if prop.atom != net_active {
+                    continue;
+                }
+                let reply = conn
+                    .get_property(false, root, net_active, AtomEnum::WINDOW, 0, 1)?
+                    .reply()?;
+                let Some(win_id) = reply.value32().and_then(|mut it| it.next()) else {
+                    continue;
+                };
+                if win_id == 0 {
+                    continue;
+                }
+
+                let class_reply = conn
+                    .get_property(false, win_id, wm_class, AtomEnum::STRING, 0, 64)?
+                    .reply()?;
+                // WM_CLASS contains `instance\0Class\0`; extract second token or fallback to first
+                let raw = String::from_utf8_lossy(&class_reply.value);
+                let parts: Vec<&str> = raw.split('\0').filter(|s| !s.is_empty()).collect();
+                let app_class = parts
+                    .get(1)
+                    .or_else(|| parts.first())
+                    .copied()
+                    .unwrap_or("")
+                    .to_string();
+
+                debug!("X11 _NET_ACTIVE_WINDOW changed: class='{}'", app_class);
+                let _ = router_tx.send(RouterEvent::WindowFocusChanged {
+                    app_class,
+                    is_xwayland: true,
+                });
             }
-
-            let class_reply = conn
-                .get_property(false, win_id, wm_class, AtomEnum::STRING, 0, 64)?
-                .reply()?;
-            // WM_CLASS contains `instance\0Class\0`; extract second token or fallback to first
-            let raw = String::from_utf8_lossy(&class_reply.value);
-            let parts: Vec<&str> = raw.split('\0').filter(|s| !s.is_empty()).collect();
-            let app_class = parts
-                .get(1)
-                .or_else(|| parts.first())
-                .copied()
-                .unwrap_or("")
-                .to_string();
-
-            debug!("X11 _NET_ACTIVE_WINDOW changed: class='{}'", app_class);
-            let _ = router_tx.send(RouterEvent::WindowFocusChanged {
-                app_class,
-                is_xwayland: true,
-            });
+            _ => {}
         }
     }
 }

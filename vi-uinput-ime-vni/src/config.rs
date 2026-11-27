@@ -15,18 +15,39 @@ pub enum ToneStyle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToggleHotkey {
+    /// Disable daemon-owned toggle hotkey so desktop switchers (GNOME/KDE/IBus/Fcitx5) never conflict.
+    #[serde(rename = "none")]
+    None,
     #[serde(rename = "ctrl+space")]
     CtrlSpace,
     #[serde(rename = "super+space")]
     SuperSpace,
 }
 
+fn default_ipc_socket_path() -> String {
+    "/run/vi-uinput-ime-vni/ipc.sock".to_string()
+}
+
+fn default_sync_desktop_layout() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneralConfig {
     pub tone_style: ToneStyle,
     pub enabled_on_start: bool,
+    /// Automatically pause to 100% PassThrough whenever desktop layout != `vi_uinput`
+    /// (GNOME Input Sources / KDE Keyboard Layouts / Fcitx5 guard via `--ipc-bridge`).
+    #[serde(default = "default_sync_desktop_layout")]
+    pub sync_desktop_layout: bool,
     pub state_file: String,
     pub xkb_keymap_path: String,
+    #[serde(default = "default_ipc_socket_path")]
+    pub ipc_socket_path: String,
+    #[serde(default)]
+    pub device_include: Vec<String>,
+    #[serde(default)]
+    pub device_exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,11 +102,15 @@ impl Default for AppConfig {
             general: GeneralConfig {
                 tone_style: ToneStyle::New,
                 enabled_on_start: true,
+                sync_desktop_layout: default_sync_desktop_layout(),
                 state_file: "/run/vi-uinput-ime-vni/state".to_string(),
                 xkb_keymap_path: "/etc/vi-uinput-ime/vn_virtual.xkb".to_string(),
+                ipc_socket_path: default_ipc_socket_path(),
+                device_include: Vec::new(),
+                device_exclude: Vec::new(),
             },
             hotkey: HotkeyConfig {
-                toggle: ToggleHotkey::CtrlSpace,
+                toggle: ToggleHotkey::None,
             },
             delays: DelayConfig {
                 default_ms: 2,
@@ -139,11 +164,18 @@ mod tests {
     #[test]
     fn parses_default_toml_and_resolves_app_delays() {
         let cfg = AppConfig::default();
+        assert_eq!(cfg.hotkey.toggle, ToggleHotkey::None);
+        assert!(cfg.general.sync_desktop_layout);
         assert_eq!(cfg.resolve_delay_ms("foot", false), 0);
         assert_eq!(cfg.resolve_delay_ms("Alacritty", false), 1);
         assert_eq!(cfg.resolve_delay_ms("chromium-browser", false), 4);
         assert_eq!(cfg.resolve_delay_ms("Code", false), 5);
         assert_eq!(cfg.resolve_delay_ms("unknown-x11-app", true), 8);
         assert_eq!(cfg.resolve_delay_ms("unknown-wayland-app", false), 2);
+
+        let default_toml = include_str!("../config/default_config.toml");
+        let parsed: AppConfig = toml::from_str(default_toml).expect("parse default_config.toml");
+        assert_eq!(parsed.hotkey.toggle, ToggleHotkey::None);
+        assert!(parsed.general.sync_desktop_layout);
     }
 }

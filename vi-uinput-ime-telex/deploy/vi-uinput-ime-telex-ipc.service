@@ -1,0 +1,26 @@
+# ~/.config/systemd/user/vi-uinput-ime-telex-ipc.service
+# User-session desktop layout & compositor IPC bridge for vi-uinput-ime-telex.
+# Runs inside the desktop user session and forwards:
+#   - GNOME / Mutter active input source (`vi_uinput` <-> US / IBus / Fcitx5)
+#   - KDE Plasma / KWin active keyboard layout (`vi_uinput` <-> US / Fcitx5)
+#   - Hyprland / Sway / X11 active window & workspace events
+# to the system daemon via /run/vi-uinput-ime-telex/ipc.sock.
+#
+# Install:
+#   install -Dm644 deploy/vi-uinput-ime-telex-ipc.service ~/.config/systemd/user/vi-uinput-ime-telex-ipc.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vi-uinput-ime-telex-ipc.service
+
+[Unit]
+Description=Desktop Layout & Compositor IPC Bridge for vi-uinput-ime-telex
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vi-uinput-ime-telex --ipc-bridge --ipc-socket /run/vi-uinput-ime-telex/ipc.sock
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

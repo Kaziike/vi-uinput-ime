@@ -22,6 +22,7 @@ TimeoutStopSec=5
 KillSignal=SIGTERM
 
 # Runtime directory for Waybar/Polybar state indicator (/run/vi-uinput-ime-vni/state)
+# and compositor IPC bridge UNIX socket (/run/vi-uinput-ime-vni/ipc.sock)
 RuntimeDirectory=vi-uinput-ime-vni
 RuntimeDirectoryMode=0755
 
@@ -40,7 +41,9 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 ReadWritePaths=-/dev/uinput /dev/input /run/vi-uinput-ime-vni
 
-# Optional: pass user session IPC env file for Hyprland/Sway/X11 focus monitoring
+# Compositor IPC Bridge: enable companion user unit `vi-uinput-ime-vni-ipc.service`
+# (`systemctl --user enable --now vi-uinput-ime-vni-ipc.service`) to forward
+# Hyprland/Sway/X11 window focus & workspace events to /run/vi-uinput-ime-vni/ipc.sock.
 EnvironmentFile=-/run/vi-uinput-ime-vni/session.env
 
 [Install]

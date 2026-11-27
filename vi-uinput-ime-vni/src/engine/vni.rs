@@ -285,7 +285,20 @@ impl SyllableState {
             for i in (0..len - 1).rev() {
                 if self.letters[i].base == 'u' && self.letters[i + 1].base == 'o' {
                     let is_qu = i > 0 && self.letters[i - 1].base == 'q';
-                    if !is_qu {
+                    if is_qu {
+                        if self.letters[i + 1].shape == VowelShape::Horn {
+                            self.letters[i + 1].shape = VowelShape::Plain;
+                            self.reposition_existing_tone(tone_style);
+                            self.disabled_for_word = true;
+                            return TransformOutcome::Undone;
+                        }
+                        self.letters[i + 1].shape = VowelShape::Horn;
+                        self.reposition_existing_tone(tone_style);
+                        return TransformOutcome::Applied;
+                    }
+
+                    let has_trailing = i + 2 < len;
+                    if has_trailing {
                         if self.letters[i].shape == VowelShape::Horn
                             && self.letters[i + 1].shape == VowelShape::Horn
                         {
@@ -296,6 +309,18 @@ impl SyllableState {
                             return TransformOutcome::Undone;
                         }
                         self.letters[i].shape = VowelShape::Horn;
+                        self.letters[i + 1].shape = VowelShape::Horn;
+                        self.reposition_existing_tone(tone_style);
+                        return TransformOutcome::Applied;
+                    } else {
+                        // Open `uo` (e.g. `thuo73` -> `thuở`): horn `o` only; auto-expands `u` -> `ư` on trailing char.
+                        if self.letters[i + 1].shape == VowelShape::Horn {
+                            self.letters[i].shape = VowelShape::Plain;
+                            self.letters[i + 1].shape = VowelShape::Plain;
+                            self.reposition_existing_tone(tone_style);
+                            self.disabled_for_word = true;
+                            return TransformOutcome::Undone;
+                        }
                         self.letters[i + 1].shape = VowelShape::Horn;
                         self.reposition_existing_tone(tone_style);
                         return TransformOutcome::Applied;
@@ -460,15 +485,25 @@ impl InputEngine for VniEngine {
         let old_rendered = word.rendered.clone();
         word.letters.push(Letter::from_ascii(c));
 
-        // Auto-horn `o` -> `ơ` when typing a coda after `ưo` (e.g., `d9u7oc5` -> `được`)
+        // Auto-expand `ưo + trailing` and non-`qu` `uơ + trailing` -> `ươ + trailing`
         let len = word.letters.len();
-        if len >= 3
-            && word.letters[len - 3].base == 'u'
-            && word.letters[len - 3].shape == VowelShape::Horn
-            && word.letters[len - 2].base == 'o'
-            && word.letters[len - 2].shape == VowelShape::Plain
-        {
-            word.letters[len - 2].shape = VowelShape::Horn;
+        if len >= 3 {
+            if word.letters[len - 3].base == 'u'
+                && word.letters[len - 3].shape == VowelShape::Horn
+                && word.letters[len - 2].base == 'o'
+                && word.letters[len - 2].shape == VowelShape::Plain
+            {
+                word.letters[len - 2].shape = VowelShape::Horn;
+            }
+            let is_qu = len >= 4 && word.letters[len - 4].base == 'q';
+            if !is_qu
+                && word.letters[len - 3].base == 'u'
+                && word.letters[len - 3].shape == VowelShape::Plain
+                && word.letters[len - 2].base == 'o'
+                && word.letters[len - 2].shape == VowelShape::Horn
+            {
+                word.letters[len - 3].shape = VowelShape::Horn;
+            }
         }
         word.reposition_existing_tone(tone_style);
 
@@ -550,7 +585,7 @@ mod tests {
                 OutputItem::VietnameseChar(c) | OutputItem::AsciiChar(c) => {
                     screen.push(c);
                 }
-                OutputItem::PassThrough { .. } => {}
+                OutputItem::PassThrough { .. } | OutputItem::SyncCapsLock(_) => {}
             }
         }
     }
@@ -800,5 +835,45 @@ mod tests {
             engine.process_separator(' ');
         }
         assert_eq!(engine.history_len(), MAX_HISTORY_ENTRIES);
+    }
+
+    #[test]
+    fn vni_clusters_ua_qua_oa_uo_and_undo() {
+        let cases = [
+            ("sua73", "sửa"),
+            ("sua37", "sửa"),
+            ("su7a3", "sửa"),
+            ("su73a", "sửa"),
+            ("cua73", "cửa"),
+            ("lua73", "lửa"),
+            ("mua7", "mưa"),
+            ("chua7", "chưa"),
+            ("d9ua7", "đưa"),
+            ("ngua75", "ngựa"),
+            ("qua8n", "quăn"),
+            ("qua8ng", "quăng"),
+            ("hoa8c5", "hoặc"),
+            ("xoa8n", "xoăn"),
+            ("quo73", "quở"),
+            ("thuo73", "thuở"),
+            ("thuo7ng", "thương"),
+            ("nuo7c1", "nước"),
+            ("nuoc71", "nước"),
+            ("tuo7i", "tươi"),
+            ("tuoi7", "tươi"),
+            ("d9uo7c5", "được"),
+            ("d9uoc75", "được"),
+            ("sua77", "sua7"),
+        ];
+
+        for (raw, expected) in cases {
+            let mut engine = VniEngine::new(ToneStyle::New);
+            let mut screen: Vec<char> = Vec::new();
+            for ch in raw.chars() {
+                sim_char(&mut engine, &mut screen, ch);
+            }
+            let got: String = screen.into_iter().collect();
+            assert_eq!(got, expected, "VNI input '{}' failed", raw);
+        }
     }
 }
