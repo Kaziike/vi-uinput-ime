@@ -8,6 +8,8 @@ tone_style = "new"
 enabled_on_start = true
 # Auto-pause to 100% PassThrough whenever GNOME/KDE switches away from `vi_uinput` (to US, IBus, Fcitx5...)
 sync_desktop_layout = true
+# Automatically restore non-Vietnamese words (English/code) back to raw ASCII keystrokes
+auto_restore_non_vn = true
 # Path to write current IME state ("VI" / "EN") for Waybar / Polybar / eww
 state_file = "/run/vi-uinput-ime-telex/state"
 # Path where custom XKB keymap is installed

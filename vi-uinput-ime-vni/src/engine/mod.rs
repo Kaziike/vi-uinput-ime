@@ -1,3 +1,4 @@
+pub mod phonology;
 pub mod vni;
 
 use crate::input::emitter::OutputItem;
@@ -6,7 +7,10 @@ use crate::xkb_gen::lookup_vn_char;
 /// Trait implemented by Vietnamese input method engines with Word History Restoration.
 pub trait InputEngine: Send {
     fn process_char(&mut self, c: char) -> Option<Vec<OutputItem>>;
-    fn process_separator(&mut self, sep: char);
+    /// Commits the active word and separator into history.
+    /// Returns `Some(batch)` when end-of-word phonology validation auto-restores a non-Vietnamese word
+    /// (the caller MUST enqueue this batch BEFORE the separator key itself on the same FIFO queue).
+    fn process_separator(&mut self, sep: char) -> Option<Vec<OutputItem>>;
     /// Returns `None` when raw physical Backspace can pass through directly via FIFO,
     /// or `Some(batch)` when deleting a character causes a tone mark to shift position.
     fn process_backspace(&mut self) -> Option<Vec<OutputItem>>;

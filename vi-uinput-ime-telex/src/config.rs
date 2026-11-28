@@ -32,6 +32,10 @@ fn default_sync_desktop_layout() -> bool {
     true
 }
 
+fn default_auto_restore_non_vn() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneralConfig {
     pub tone_style: ToneStyle,
@@ -40,6 +44,9 @@ pub struct GeneralConfig {
     /// (GNOME Input Sources / KDE Keyboard Layouts / Fcitx5 guard via `--ipc-bridge`).
     #[serde(default = "default_sync_desktop_layout")]
     pub sync_desktop_layout: bool,
+    /// Automatically restore non-Vietnamese words (e.g. English/code identifiers) back to raw ASCII.
+    #[serde(default = "default_auto_restore_non_vn")]
+    pub auto_restore_non_vn: bool,
     pub state_file: String,
     pub xkb_keymap_path: String,
     #[serde(default = "default_ipc_socket_path")]
@@ -103,6 +110,7 @@ impl Default for AppConfig {
                 tone_style: ToneStyle::New,
                 enabled_on_start: true,
                 sync_desktop_layout: default_sync_desktop_layout(),
+                auto_restore_non_vn: default_auto_restore_non_vn(),
                 state_file: "/run/vi-uinput-ime-telex/state".to_string(),
                 xkb_keymap_path: "/etc/vi-uinput-ime/vn_virtual.xkb".to_string(),
                 ipc_socket_path: default_ipc_socket_path(),
@@ -166,6 +174,7 @@ mod tests {
         let cfg = AppConfig::default();
         assert_eq!(cfg.hotkey.toggle, ToggleHotkey::None);
         assert!(cfg.general.sync_desktop_layout);
+        assert!(cfg.general.auto_restore_non_vn);
         assert_eq!(cfg.resolve_delay_ms("foot", false), 0);
         assert_eq!(cfg.resolve_delay_ms("Alacritty", false), 1);
         assert_eq!(cfg.resolve_delay_ms("chromium-browser", false), 4);
@@ -177,5 +186,6 @@ mod tests {
         let parsed: AppConfig = toml::from_str(default_toml).expect("parse default_config.toml");
         assert_eq!(parsed.hotkey.toggle, ToggleHotkey::None);
         assert!(parsed.general.sync_desktop_layout);
+        assert!(parsed.general.auto_restore_non_vn);
     }
 }

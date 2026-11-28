@@ -162,6 +162,11 @@ impl TelexRouter {
         self
     }
 
+    fn with_auto_restore_non_vn(mut self, enabled: bool) -> Self {
+        self.engine.set_auto_restore_non_vn(enabled);
+        self
+    }
+
     fn effective_enabled(&self) -> bool {
         self.manual_enabled && self.desktop_layout_active
     }
@@ -258,15 +263,20 @@ impl TelexRouter {
             return (vec![OutputItem::PassThrough { code, value }], None);
         }
 
-        // 6. Space separator: push active word + Separator(' ') into history ring buffer (including repeat!)
+        // 6. Space separator: run final phonology check (if invalid, enqueue restore diff BEFORE Space
+        //    on the same single FIFO queue) and push active word + Separator(' ') into history ring buffer.
         if code == Key::KEY_SPACE {
+            let mut items = Vec::new();
             if value == 1 || value == 2 {
-                self.engine.process_separator(' ');
+                if let Some(restore_batch) = self.engine.process_separator(' ') {
+                    items.extend(restore_batch);
+                }
             }
             if value == 1 {
                 self.passthrough_held.insert(code);
             }
-            return (vec![OutputItem::PassThrough { code, value }], None);
+            items.push(OutputItem::PassThrough { code, value });
+            return (items, None);
         }
 
         // 7. Physical Backspace (supports Word History Restoration + smooth raw repeat)
@@ -454,15 +464,17 @@ async fn main() -> Result<()> {
         config.general.enabled_on_start,
         config.hotkey.toggle,
     )
-    .with_desktop_layout_sync(config.general.sync_desktop_layout);
+    .with_desktop_layout_sync(config.general.sync_desktop_layout)
+    .with_auto_restore_non_vn(config.general.auto_restore_non_vn);
 
     write_state_file(&config.general.state_file, router.effective_enabled());
 
     info!(
-        "vi-uinput-ime-telex started (tone={:?}, toggle={:?}, sync_desktop_layout={}, active={}, default_delay={}ms, ipc_socket={})",
+        "vi-uinput-ime-telex started (tone={:?}, toggle={:?}, sync_desktop_layout={}, auto_restore_non_vn={}, active={}, default_delay={}ms, ipc_socket={})",
         config.general.tone_style,
         config.hotkey.toggle,
         config.general.sync_desktop_layout,
+        config.general.auto_restore_non_vn,
         router.effective_enabled(),
         config.delays.default_ms,
         config.general.ipc_socket_path
@@ -839,6 +851,38 @@ mod tests {
         assert_eq!(router.on_ipc_bridge_disconnected(), Some(false));
         assert!(!router.effective_enabled());
 
+        assert!(held.is_empty(), "Stuck virtual keys: {:?}", held);
+        assert!(router.passthrough_held.is_empty());
+    }
+
+    #[test]
+    fn telex_router_space_enqueues_auto_restore_batch_strictly_before_space_passthrough() {
+        let mut router = TelexRouter::new(config::ToneStyle::New, true, ToggleHotkey::None)
+            .with_auto_restore_non_vn(true);
+        let mut screen: Vec<char> = Vec::new();
+        let mut held: HashSet<Key> = HashSet::new();
+
+        for k in [Key::KEY_P, Key::KEY_O, Key::KEY_R, Key::KEY_T] {
+            tap_key(&mut router, &mut screen, &mut held, k);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "pỏt");
+
+        let space_batch = tap_key(&mut router, &mut screen, &mut held, Key::KEY_SPACE);
+        assert_eq!(
+            space_batch,
+            vec![
+                OutputItem::Backspace,
+                OutputItem::Backspace,
+                OutputItem::AsciiChar('o'),
+                OutputItem::AsciiChar('r'),
+                OutputItem::AsciiChar('t'),
+                OutputItem::PassThrough {
+                    code: Key::KEY_SPACE,
+                    value: 1,
+                },
+            ]
+        );
+        assert_eq!(screen.iter().collect::<String>(), "port ");
         assert!(held.is_empty(), "Stuck virtual keys: {:?}", held);
         assert!(router.passthrough_held.is_empty());
     }

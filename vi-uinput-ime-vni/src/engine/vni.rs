@@ -1,28 +1,13 @@
 use crate::config::ToneStyle;
+use crate::engine::phonology::{
+    validate_final, validate_partial, Letter, Tone, VowelShape,
+};
 use crate::engine::{diff_words_to_output, InputEngine};
 use crate::input::emitter::OutputItem;
 use std::collections::VecDeque;
 
 /// Maximum number of word/separator entries retained in the history ring buffer.
 pub const MAX_HISTORY_ENTRIES: usize = 15;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VowelShape {
-    Plain,
-    Circumflex, // â, ê, ô (6)
-    Breve,      // ă (8)
-    Horn,       // ơ, ư (7)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tone {
-    None = 0,
-    Acute = 1,     // sắc (1)
-    Grave = 2,     // huyền (2)
-    HookAbove = 3, // hỏi (3)
-    Tilde = 4,     // ngã (4)
-    DotBelow = 5,  // nặng (5)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransformOutcome {
@@ -34,72 +19,13 @@ enum TransformOutcome {
     NoMatch,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Letter {
-    base: char,
-    upper: bool,
-    shape: VowelShape,
-    tone: Tone,
-    d_bar: bool,
-}
-
-impl Letter {
-    fn from_ascii(c: char) -> Self {
-        Self {
-            base: c.to_ascii_lowercase(),
-            upper: c.is_ascii_uppercase(),
-            shape: VowelShape::Plain,
-            tone: Tone::None,
-            d_bar: false,
-        }
-    }
-
-    fn is_vowel(&self) -> bool {
-        matches!(self.base, 'a' | 'e' | 'i' | 'o' | 'u' | 'y')
-    }
-
-    fn render(&self) -> char {
-        let ch = if self.base == 'd' && self.d_bar {
-            'đ'
-        } else {
-            compose_vn_vowel(self.base, self.shape, self.tone).unwrap_or(self.base)
-        };
-        if self.upper {
-            to_vn_upper(ch)
-        } else {
-            ch
-        }
-    }
-}
-
-fn to_vn_upper(c: char) -> char {
-    c.to_uppercase().next().unwrap_or(c)
-}
-
-fn compose_vn_vowel(base: char, shape: VowelShape, tone: Tone) -> Option<char> {
-    let idx = tone as usize;
-    let table: Option<[char; 6]> = match (base, shape) {
-        ('a', VowelShape::Plain) => Some(['a', 'á', 'à', 'ả', 'ã', 'ạ']),
-        ('a', VowelShape::Breve) => Some(['ă', 'ắ', 'ằ', 'ẳ', 'ẵ', 'ặ']),
-        ('a', VowelShape::Circumflex) => Some(['â', 'ấ', 'ầ', 'ẩ', 'ẫ', 'ậ']),
-        ('e', VowelShape::Plain) => Some(['e', 'é', 'è', 'ẻ', 'ẽ', 'ẹ']),
-        ('e', VowelShape::Circumflex) => Some(['ê', 'ế', 'ề', 'ể', 'ễ', 'ệ']),
-        ('i', VowelShape::Plain) => Some(['i', 'í', 'ì', 'ỉ', 'ĩ', 'ị']),
-        ('o', VowelShape::Plain) => Some(['o', 'ó', 'ò', 'ỏ', 'õ', 'ọ']),
-        ('o', VowelShape::Circumflex) => Some(['ô', 'ố', 'ồ', 'ổ', 'ỗ', 'ộ']),
-        ('o', VowelShape::Horn) => Some(['ơ', 'ớ', 'ờ', 'ở', 'ỡ', 'ợ']),
-        ('u', VowelShape::Plain) => Some(['u', 'ú', 'ù', 'ủ', 'ũ', 'ụ']),
-        ('u', VowelShape::Horn) => Some(['ư', 'ứ', 'ừ', 'ử', 'ữ', 'ự']),
-        ('y', VowelShape::Plain) => Some(['y', 'ý', 'ỳ', 'ỷ', 'ỹ', 'ỵ']),
-        _ => None,
-    };
-    table.map(|t| t[idx])
-}
-
 /// Complete internal state of a single Vietnamese syllable/word (case, vowel shapes, tones, rendered text).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyllableState {
     letters: Vec<Letter>,
+    /// Exact raw ASCII keystrokes typed by the user (preserving original capitalization and digits)
+    /// so non-Vietnamese words can be restored cleanly without losing characters or case.
+    raw_keys: Vec<char>,
     rendered: String,
     disabled_for_word: bool,
 }
@@ -108,6 +34,7 @@ impl SyllableState {
     fn new() -> Self {
         Self {
             letters: Vec::with_capacity(16),
+            raw_keys: Vec::with_capacity(24),
             rendered: String::with_capacity(32),
             disabled_for_word: false,
         }
@@ -115,6 +42,31 @@ impl SyllableState {
 
     fn render_buffer(&self) -> String {
         self.letters.iter().map(Letter::render).collect()
+    }
+
+    fn raw_string(&self) -> String {
+        self.raw_keys.iter().collect()
+    }
+
+    fn has_any_diacritic(&self) -> bool {
+        self.letters
+            .iter()
+            .any(|l| l.shape != VowelShape::Plain || l.tone != Tone::None || l.d_bar)
+    }
+
+    /// Restores the syllable to its exact raw ASCII keystrokes and disables further
+    /// Vietnamese transforms for this word (including across Space + Backspace history restore).
+    ///
+    /// Returns `None` if `self.rendered` already equals `raw_keys` (zero redraw / zero flicker).
+    pub fn restore_to_raw(&mut self) -> Option<Vec<OutputItem>> {
+        let raw_str = self.raw_string();
+        self.disabled_for_word = true;
+        if self.rendered == raw_str {
+            return None;
+        }
+        let old_rendered = std::mem::replace(&mut self.rendered, raw_str.clone());
+        self.letters = self.raw_keys.iter().copied().map(Letter::from_ascii).collect();
+        Some(diff_words_to_output(&old_rendered, &raw_str))
     }
 
     fn nucleus_vowel_indices(&self) -> Vec<usize> {
@@ -404,6 +356,7 @@ pub enum HistoryEntry {
 /// - `6`=mũ (â, ê, ô), `7`=móc (ơ, ư, uo→ươ), `8`=trăng (ă), `9`=đ
 pub struct VniEngine {
     tone_style: ToneStyle,
+    auto_restore_non_vn: bool,
     active_word: Option<SyllableState>,
     history: VecDeque<HistoryEntry>,
 }
@@ -412,9 +365,14 @@ impl VniEngine {
     pub fn new(tone_style: ToneStyle) -> Self {
         Self {
             tone_style,
+            auto_restore_non_vn: true,
             active_word: None,
             history: VecDeque::with_capacity(MAX_HISTORY_ENTRIES),
         }
+    }
+
+    pub fn set_auto_restore_non_vn(&mut self, enabled: bool) {
+        self.auto_restore_non_vn = enabled;
     }
 
     #[allow(dead_code)]
@@ -442,7 +400,10 @@ impl VniEngine {
 impl InputEngine for VniEngine {
     fn process_char(&mut self, c: char) -> Option<Vec<OutputItem>> {
         if c == ' ' {
-            self.process_separator(' ');
+            if let Some(mut batch) = self.process_separator(' ') {
+                batch.push(OutputItem::AsciiChar(' '));
+                return Some(batch);
+            }
             return None;
         }
 
@@ -457,6 +418,7 @@ impl InputEngine for VniEngine {
             let old_rendered = word.rendered.clone();
             match word.try_vni_digit(c, tone_style) {
                 TransformOutcome::Applied => {
+                    word.raw_keys.push(c);
                     let new_rendered = word.render_buffer();
                     word.rendered = new_rendered.clone();
                     return Some(diff_words_to_output(&old_rendered, &new_rendered));
@@ -481,44 +443,65 @@ impl InputEngine for VniEngine {
         }
 
         let tone_style = self.tone_style;
+        let auto_restore = self.auto_restore_non_vn;
         let word = self.active_word.get_or_insert_with(SyllableState::new);
         let old_rendered = word.rendered.clone();
+
+        word.raw_keys.push(c);
         word.letters.push(Letter::from_ascii(c));
 
-        // Auto-expand `ưo + trailing` and non-`qu` `uơ + trailing` -> `ươ + trailing`
-        let len = word.letters.len();
-        if len >= 3 {
-            if word.letters[len - 3].base == 'u'
-                && word.letters[len - 3].shape == VowelShape::Horn
-                && word.letters[len - 2].base == 'o'
-                && word.letters[len - 2].shape == VowelShape::Plain
-            {
-                word.letters[len - 2].shape = VowelShape::Horn;
+        if !word.disabled_for_word {
+            // Auto-expand `ưo + trailing` and non-`qu` `uơ + trailing` -> `ươ + trailing`
+            let len = word.letters.len();
+            if len >= 3 {
+                if word.letters[len - 3].base == 'u'
+                    && word.letters[len - 3].shape == VowelShape::Horn
+                    && word.letters[len - 2].base == 'o'
+                    && word.letters[len - 2].shape == VowelShape::Plain
+                {
+                    word.letters[len - 2].shape = VowelShape::Horn;
+                }
+                let is_qu = len >= 4 && word.letters[len - 4].base == 'q';
+                if !is_qu
+                    && word.letters[len - 3].base == 'u'
+                    && word.letters[len - 3].shape == VowelShape::Plain
+                    && word.letters[len - 2].base == 'o'
+                    && word.letters[len - 2].shape == VowelShape::Horn
+                {
+                    word.letters[len - 3].shape = VowelShape::Horn;
+                }
             }
-            let is_qu = len >= 4 && word.letters[len - 4].base == 'q';
-            if !is_qu
-                && word.letters[len - 3].base == 'u'
-                && word.letters[len - 3].shape == VowelShape::Plain
-                && word.letters[len - 2].base == 'o'
-                && word.letters[len - 2].shape == VowelShape::Horn
-            {
-                word.letters[len - 3].shape = VowelShape::Horn;
+            word.reposition_existing_tone(tone_style);
+
+            if auto_restore && !validate_partial(&word.letters) {
+                let batch = word
+                    .restore_to_raw()
+                    .unwrap_or_else(|| diff_words_to_output(&old_rendered, &word.rendered));
+                return Some(batch);
             }
         }
-        word.reposition_existing_tone(tone_style);
 
         let new_rendered = word.render_buffer();
         word.rendered = new_rendered.clone();
         Some(diff_words_to_output(&old_rendered, &new_rendered))
     }
 
-    fn process_separator(&mut self, sep: char) {
-        if let Some(word) = self.active_word.take() {
+    fn process_separator(&mut self, sep: char) -> Option<Vec<OutputItem>> {
+        let mut restore_batch = None;
+        if let Some(mut word) = self.active_word.take() {
             if !word.letters.is_empty() {
+                if sep == ' '
+                    && self.auto_restore_non_vn
+                    && !word.disabled_for_word
+                    && !validate_final(&word.letters)
+                {
+                    restore_batch = word.restore_to_raw();
+                }
                 self.push_history(HistoryEntry::Word(word));
             }
         }
         self.push_history(HistoryEntry::Separator(sep));
+        restore_batch
     }
 
     fn process_backspace(&mut self) -> Option<Vec<OutputItem>> {
@@ -528,7 +511,7 @@ impl InputEngine for VniEngine {
             let mut expected_if_raw_bs = old_rendered.clone();
             expected_if_raw_bs.pop();
 
-            word.letters.pop();
+            let popped = word.letters.pop();
 
             if word.letters.is_empty() {
                 // Active word is now empty; leave active_word = None WITHOUT popping history
@@ -536,7 +519,23 @@ impl InputEngine for VniEngine {
                 return None;
             }
 
-            word.reposition_existing_tone(self.tone_style);
+            if word.disabled_for_word {
+                word.raw_keys.pop();
+            } else if !word.has_any_diacritic() {
+                word.raw_keys = word.letters.iter().map(Letter::render).collect();
+            } else if let Some(popped_letter) = popped {
+                if let Some(pos) = word
+                    .raw_keys
+                    .iter()
+                    .rposition(|ch| ch.to_ascii_lowercase() == popped_letter.base)
+                {
+                    word.raw_keys.remove(pos);
+                }
+            }
+
+            if !word.disabled_for_word {
+                word.reposition_existing_tone(self.tone_style);
+            }
             let new_rendered = word.render_buffer();
             word.rendered = new_rendered.clone();
             self.active_word = Some(word);
@@ -697,6 +696,14 @@ mod tests {
         engine.clear_all();
         assert_eq!(simulate_typing(&mut engine, "d99"), "d9");
         engine.clear_all();
+        // With phonology auto-restore ON, English `user` is auto-disabled so `user123` needs no double-tap!
+        assert_eq!(simulate_typing(&mut engine, "user123"), "user123");
+        engine.clear_all();
+        // Double-tap undo still works on Vietnamese-compatible prefixes like `an1123` -> `an123`
+        assert_eq!(simulate_typing(&mut engine, "an1123"), "an123");
+        engine.clear_all();
+        // And with auto_restore_non_vn OFF, legacy `user1123` -> `user123` still works
+        engine.set_auto_restore_non_vn(false);
         assert_eq!(simulate_typing(&mut engine, "user1123"), "user123");
     }
 
@@ -875,5 +882,155 @@ mod tests {
             let got: String = screen.into_iter().collect();
             assert_eq!(got, expected, "VNI input '{}' failed", raw);
         }
+    }
+
+    #[test]
+    fn vni_auto_restore_suite_1_leading_f_j_w_z() {
+        let words = [
+            "fix1", "file2", "from3", "for4", "function5", "window6", "with7", "just8", "json9",
+            "zip1", "fix", "window", "just", "zip",
+        ];
+        for w in words {
+            let mut engine = VniEngine::new(ToneStyle::New);
+            assert_eq!(simulate_typing(&mut engine, w), w, "VNI leading f/j/w/z failed for '{}'", w);
+        }
+    }
+
+    #[test]
+    fn vni_auto_restore_suite_2_english_onset_clusters() {
+        let words = [
+            "struct1", "string2", "print3", "class4", "float5", "switch6", "branch7", "clone8",
+            "shell9", "script1",
+        ];
+        for w in words {
+            let mut engine = VniEngine::new(ToneStyle::New);
+            assert_eq!(simulate_typing(&mut engine, w), w, "VNI onset cluster failed for '{}'", w);
+        }
+    }
+
+    #[test]
+    fn vni_auto_restore_suite_3_immediate_restore_bad_coda_or_vowel_after_coda() {
+        let words = [
+            "server", "config", "code", "return", "import", "export", "buffer", "local", "linux",
+            "github", "kernel", "driver", "wayland", "systemd", "config8080", "local1",
+            "se3ver", "co2nfig",
+        ];
+        for w in words {
+            let mut engine = VniEngine::new(ToneStyle::New);
+            assert_eq!(
+                simulate_typing(&mut engine, w),
+                w,
+                "VNI immediate restore failed for '{}'",
+                w
+            );
+        }
+    }
+
+    #[test]
+    fn vni_auto_restore_suite_4_deferred_restore_on_space() {
+        let cases = [
+            ("po3t ", "po3t "),
+            ("te4t ", "te4t "),
+            ("ca1e ", "ca1e "),
+            ("ba1e ", "ba1e "),
+            ("main ", "main "),
+            ("ma1in ", "ma1in "),
+            ("PO3T ", "PO3T "),
+            ("sa8 ", "sa8 "),
+        ];
+        for (raw, expected) in cases {
+            let mut engine = VniEngine::new(ToneStyle::New);
+            assert_eq!(
+                simulate_typing(&mut engine, raw),
+                expected,
+                "VNI deferred space restore failed for '{}'",
+                raw
+            );
+        }
+
+        // Verify `process_separator(' ')` explicitly returns the restore diff batch before Space
+        let mut engine = VniEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+        for ch in "po3t".chars() {
+            sim_char(&mut engine, &mut screen, ch);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "pỏt");
+        let batch = engine
+            .process_separator(' ')
+            .expect("po3t must emit restore batch before Space");
+        assert_eq!(
+            batch,
+            vec![
+                OutputItem::Backspace,
+                OutputItem::Backspace,
+                OutputItem::AsciiChar('o'),
+                OutputItem::AsciiChar('3'),
+                OutputItem::AsciiChar('t'),
+            ]
+        );
+        apply_batch(&mut screen, &batch);
+        screen.push(' ');
+        assert_eq!(screen.iter().collect::<String>(), "po3t ");
+    }
+
+    #[test]
+    fn vni_auto_restore_suite_5_vietnamese_free_order_and_word_history_non_regression() {
+        let vn_free_order = [
+            ("tie6n1 ", "tiến "),
+            ("tien61 ", "tiến "),
+            ("nuoc71 ", "nước "),
+            ("duong72 ", "dường "),
+            ("sua73 ", "sửa "),
+            ("huyen62 ", "huyền "),
+            ("d9uo7c5 ", "được "),
+            ("giuo7ng2 ", "giường "),
+            ("nguo7i2 ", "người "),
+            ("qua8ng ", "quăng "),
+            ("kho6ng ", "không "),
+            ("thuo73 ", "thuở "),
+            ("quy1t ", "quýt "),
+            ("ko ", "ko "),
+            ("k ", "k "),
+        ];
+        for (raw, expected) in vn_free_order {
+            let mut eng = VniEngine::new(ToneStyle::New);
+            assert_eq!(
+                simulate_typing(&mut eng, raw),
+                expected,
+                "VNI Vietnamese free-order regression on '{}'",
+                raw
+            );
+        }
+
+        // `Na8ng Space Backspace 6` -> `"Nâng"`
+        let mut eng = VniEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+        for ch in "Na8ng ".chars() {
+            sim_char(&mut eng, &mut screen, ch);
+        }
+        sim_backspace(&mut eng, &mut screen);
+        sim_char(&mut eng, &mut screen, '6');
+        assert_eq!(screen.iter().collect::<String>(), "Nâng");
+
+        // `config Space Backspace 1` -> `"config1"` (disabled_for_word preserved in HistoryEntry::Word)
+        let mut eng = VniEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+        for ch in "config ".chars() {
+            sim_char(&mut eng, &mut screen, ch);
+        }
+        sim_backspace(&mut eng, &mut screen);
+        sim_char(&mut eng, &mut screen, '1');
+        assert_eq!(screen.iter().collect::<String>(), "config1");
+
+        // `po3t Space Backspace 1` -> `"po3t1"` (deferred restore locks disabled_for_word in history)
+        let mut eng = VniEngine::new(ToneStyle::New);
+        let mut screen: Vec<char> = Vec::new();
+        for ch in "po3t ".chars() {
+            sim_char(&mut eng, &mut screen, ch);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "po3t ");
+        sim_backspace(&mut eng, &mut screen);
+        sim_char(&mut eng, &mut screen, '1');
+        assert_eq!(screen.iter().collect::<String>(), "po3t1");
     }
 }
