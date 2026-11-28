@@ -14,12 +14,17 @@ use input::grabber::{
     emergency_ungrab_all, install_failsafe_panic_hook, spawn_device_reader, RouterEvent,
 };
 use input::scanner::{spawn_hotplug_scanner, DeviceFilter};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+
+/// Holding any non-Backspace key continuously for >= 200ms indicates intentional key-hold
+/// (e.g. WASD game movement) rather than Vietnamese syllable typing (typical dwell 40–140ms).
+const HOLD_RESET_THRESHOLD: Duration = Duration::from_millis(200);
 
 #[derive(Default)]
 struct ModifierState {
@@ -133,11 +138,15 @@ struct TelexRouter {
     mods: ModifierState,
     manual_enabled: bool,
     desktop_layout_active: bool,
+    window_passthrough: bool,
     sync_desktop_layout: bool,
     toggle_hotkey: ToggleHotkey,
     /// Tracks every non-modifier key whose `value == 1` press was forwarded as `PassThrough`,
     /// guaranteeing its matching repeat (`value == 2`) and release (`value == 0`) are NEVER swallowed.
     passthrough_held: HashSet<Key>,
+    /// Timestamp when each currently held `PassThrough` key was pressed, used to distinguish
+    /// intentional key holds (>= 200ms, e.g. WASD movement) from fast typing rollover (< 200ms).
+    held_since: HashMap<Key, Instant>,
 }
 
 impl TelexRouter {
@@ -147,9 +156,11 @@ impl TelexRouter {
             mods: ModifierState::default(),
             manual_enabled,
             desktop_layout_active: true,
+            window_passthrough: false,
             sync_desktop_layout: false,
             toggle_hotkey,
             passthrough_held: HashSet::new(),
+            held_since: HashMap::new(),
         }
     }
 
@@ -168,11 +179,17 @@ impl TelexRouter {
     }
 
     fn effective_enabled(&self) -> bool {
-        self.manual_enabled && self.desktop_layout_active
+        self.manual_enabled && self.desktop_layout_active && !self.window_passthrough
     }
 
     fn set_desktop_layout_active(&mut self, active: bool) -> bool {
         self.desktop_layout_active = active;
+        self.engine.clear_all();
+        self.effective_enabled()
+    }
+
+    fn set_window_passthrough(&mut self, passthrough: bool) -> bool {
+        self.window_passthrough = passthrough;
         self.engine.clear_all();
         self.effective_enabled()
     }
@@ -194,14 +211,44 @@ impl TelexRouter {
         self.mods.caps_lock = on;
     }
 
+    fn mark_passthrough_down(&mut self, code: Key, now: Instant) {
+        self.passthrough_held.insert(code);
+        self.held_since.insert(code, now);
+    }
+
+    fn any_key_held_long(&self, now: Instant) -> bool {
+        self.held_since.iter().any(|(&k, &pressed_at)| {
+            k != Key::KEY_BACKSPACE
+                && now.saturating_duration_since(pressed_at) >= HOLD_RESET_THRESHOLD
+        })
+    }
+
     fn handle_raw_key(&mut self, code: Key, value: i32) -> (Vec<OutputItem>, Option<bool>) {
+        self.handle_raw_key_at(code, value, Instant::now())
+    }
+
+    fn handle_raw_key_at(
+        &mut self,
+        code: Key,
+        value: i32,
+        now: Instant,
+    ) -> (Vec<OutputItem>, Option<bool>) {
         // 1. Always track & forward modifier keys verbatim
         if self.mods.update(code, value) {
             return (vec![OutputItem::PassThrough { code, value }], None);
         }
 
         // 2. Key release (`value == 0`): ALWAYS forward release iff its press was passed through!
+        //    If a non-Backspace key was held continuously for >= 200ms (e.g. WASD movement),
+        //    invalidate the syllable buffer so the next directional key never turns into ă/á/đ.
         if value == 0 {
+            if let Some(pressed_at) = self.held_since.remove(&code) {
+                if code != Key::KEY_BACKSPACE
+                    && now.saturating_duration_since(pressed_at) >= HOLD_RESET_THRESHOLD
+                {
+                    self.engine.clear_all();
+                }
+            }
             if self.passthrough_held.remove(&code) {
                 return (vec![OutputItem::PassThrough { code, value: 0 }], None);
             }
@@ -210,10 +257,13 @@ impl TelexRouter {
 
         // 3. Key repeat (`value == 2`) for already passed-through keys EXCEPT Backspace/Space
         //    (Backspace and Space must update the history ring buffer on every repeat tick).
+        //    Holding a key until OS/kernel repeat fires clearly indicates key-hold, not syllable
+        //    composition, so clear pending syllable state while forwarding smooth raw repeat.
         if value == 2
             && !matches!(code, Key::KEY_BACKSPACE | Key::KEY_SPACE)
             && self.passthrough_held.contains(&code)
         {
+            self.engine.clear_all();
             return (vec![OutputItem::PassThrough { code, value: 2 }], None);
         }
 
@@ -258,7 +308,7 @@ impl TelexRouter {
                 self.engine.clear_all();
             }
             if value == 1 {
-                self.passthrough_held.insert(code);
+                self.mark_passthrough_down(code, now);
             }
             return (vec![OutputItem::PassThrough { code, value }], None);
         }
@@ -268,12 +318,15 @@ impl TelexRouter {
         if code == Key::KEY_SPACE {
             let mut items = Vec::new();
             if value == 1 || value == 2 {
+                if value == 1 && self.any_key_held_long(now) {
+                    self.engine.clear_all();
+                }
                 if let Some(restore_batch) = self.engine.process_separator(' ') {
                     items.extend(restore_batch);
                 }
             }
             if value == 1 {
-                self.passthrough_held.insert(code);
+                self.mark_passthrough_down(code, now);
             }
             items.push(OutputItem::PassThrough { code, value });
             return (items, None);
@@ -283,6 +336,7 @@ impl TelexRouter {
         if code == Key::KEY_BACKSPACE {
             if value == 1 || value == 2 {
                 if let Some(mut batch) = self.engine.process_backspace() {
+                    self.held_since.remove(&Key::KEY_BACKSPACE);
                     if self.passthrough_held.remove(&Key::KEY_BACKSPACE) {
                         batch.insert(
                             0,
@@ -299,18 +353,39 @@ impl TelexRouter {
                 }
             }
             if value == 1 {
-                self.passthrough_held.insert(code);
+                self.mark_passthrough_down(code, now);
             }
             return (vec![OutputItem::PassThrough { code, value }], None);
         }
 
         // 8. Telex ASCII letters (`a..z`, `A..Z`)
         if let Some(ch) = key_to_telex_char(code, self.mods.shift(), self.mods.caps_lock) {
-            if let Some(batch) = self.engine.process_char(ch) {
+            // Repeat on a letter whose initial press was consumed by a transform (e.g. quick
+            // diagonal `A+W` held in a game): promote into a real continuous PassThrough hold.
+            if value == 2 {
+                self.engine.clear_all();
+                self.mark_passthrough_down(code, now);
+                return (vec![OutputItem::PassThrough { code, value: 1 }], None);
+            }
+            // If another key is already held >= 200ms (e.g. walking left with A, then pressing W/S),
+            // clear pending syllable first so diagonal movement passes straight through.
+            if value == 1 && self.any_key_held_long(now) {
+                self.engine.clear_all();
+            }
+            if let Some(mut batch) = self.engine.process_char(ch) {
+                // Hold-preserving PassThrough: whenever the batch ends with the exact raw ASCII
+                // character of the physically pressed key (all plain untransformed letters like
+                // W/A/S/D as well as auto-restore/undo tails), emit PassThrough { value: 1 } so
+                // the virtual key stays genuinely held until physical release (critical for games).
+                if value == 1 && batch.last() == Some(&OutputItem::AsciiChar(ch)) {
+                    batch.pop();
+                    self.mark_passthrough_down(code, now);
+                    batch.push(OutputItem::PassThrough { code, value: 1 });
+                }
                 return (batch, None);
             }
             if value == 1 {
-                self.passthrough_held.insert(code);
+                self.mark_passthrough_down(code, now);
             }
             return (vec![OutputItem::PassThrough { code, value }], None);
         }
@@ -320,7 +395,7 @@ impl TelexRouter {
             self.engine.clear_all();
         }
         if value == 1 {
-            self.passthrough_held.insert(code);
+            self.mark_passthrough_down(code, now);
         }
         (vec![OutputItem::PassThrough { code, value }], None)
     }
@@ -521,7 +596,21 @@ async fn main() -> Result<()> {
                         router.clear_all();
                     }
                     RouterEvent::WindowFocusChanged { app_class, is_xwayland } => {
-                        router.clear_all();
+                        let prev_eff = router.effective_enabled();
+                        let new_eff =
+                            router.set_window_passthrough(config.is_passthrough_app(&app_class));
+                        if new_eff != prev_eff {
+                            write_state_file(&config.general.state_file, new_eff);
+                            info!(
+                                "Window '{}' -> Telex IME {}",
+                                app_class,
+                                if new_eff {
+                                    "ACTIVE (VI)"
+                                } else {
+                                    "PAUSED (App PassThrough)"
+                                }
+                            );
+                        }
                         let delay_ms = config.resolve_delay_ms(&app_class, is_xwayland);
                         emitter.set_delay_ms(delay_ms);
                     }
@@ -568,12 +657,18 @@ mod tests {
                         virtual_held.remove(&code);
                     }
                     if value == 1 || value == 2 {
+                        let shift = virtual_held.contains(&Key::KEY_LEFTSHIFT)
+                            || virtual_held.contains(&Key::KEY_RIGHTSHIFT);
                         match code {
                             Key::KEY_SPACE => screen.push(' '),
                             Key::KEY_BACKSPACE => {
                                 screen.pop();
                             }
-                            _ => {}
+                            other => {
+                                if let Some(ch) = key_to_telex_char(other, shift, false) {
+                                    screen.push(ch);
+                                }
+                            }
                         }
                     }
                 }
@@ -679,10 +774,16 @@ mod tests {
         router.clear_all();
         assert_eq!(router.engine.history_len(), 0);
 
-        // Press Backspace + 'a' -> does NOT modify "Tối"
+        // Press Backspace + 'a' -> does NOT modify "Tối" (passes through cleanly with hold support)
         tap_key(&mut router, &mut screen, &mut held, Key::KEY_BACKSPACE);
         let batch = tap_key(&mut router, &mut screen, &mut held, Key::KEY_A);
-        assert_eq!(batch, vec![OutputItem::AsciiChar('a')]);
+        assert_eq!(
+            batch,
+            vec![OutputItem::PassThrough {
+                code: Key::KEY_A,
+                value: 1,
+            }]
+        );
         assert_eq!(screen.iter().collect::<String>(), "Tốia");
 
         // Ctrl+Backspace must also call clear_all()
@@ -819,6 +920,8 @@ mod tests {
             assert_eq!(up, vec![OutputItem::PassThrough { code: k, value: 0 }]);
             apply_router_output(&mut screen, &mut held, &up);
         }
+        assert_eq!(screen.iter().collect::<String>(), "test");
+        screen.clear();
 
         // Desktop switches to `vi_uinput` -> Telex activates immediately (`suawr` -> "sửa")
         assert!(router.set_desktop_layout_active(true));
@@ -885,5 +988,188 @@ mod tests {
         assert_eq!(screen.iter().collect::<String>(), "port ");
         assert!(held.is_empty(), "Stuck virtual keys: {:?}", held);
         assert!(router.passthrough_held.is_empty());
+    }
+
+    #[test]
+    fn game_wasd_holds_stay_continuously_down_without_stutter_or_diacritic_corruption() {
+        let mut router = TelexRouter::new(config::ToneStyle::New, true, ToggleHotkey::None);
+        let mut screen: Vec<char> = Vec::new();
+        let mut held: HashSet<Key> = HashSet::new();
+        let t0 = Instant::now();
+
+        // 1. Minecraft / Goose Goose Duck: hold W, A, S, D individually -> MUST stay held as PassThrough
+        //    (never premature value=0!) and repeat value=2 must NOT turn `a`->`â` or `d`->`đ`.
+        for (idx, k) in [Key::KEY_W, Key::KEY_A, Key::KEY_S, Key::KEY_D]
+            .into_iter()
+            .enumerate()
+        {
+            let base = t0 + Duration::from_secs(idx as u64);
+            let (down, _) = router.handle_raw_key_at(k, 1, base);
+            assert_eq!(down, vec![OutputItem::PassThrough { code: k, value: 1 }]);
+            apply_router_output(&mut screen, &mut held, &down);
+            assert!(held.contains(&k), "{:?} must remain held on virtual keyboard", k);
+
+            // Repeat ticks while held -> smooth raw repeat, zero Backspace / VietnameseChar!
+            for tick in 1..=5 {
+                let (rep, _) = router.handle_raw_key_at(
+                    k,
+                    2,
+                    base + Duration::from_millis(250 + tick * 33),
+                );
+                assert_eq!(rep, vec![OutputItem::PassThrough { code: k, value: 2 }]);
+                assert!(held.contains(&k));
+            }
+
+            let (up, _) = router.handle_raw_key_at(k, 0, base + Duration::from_millis(500));
+            assert_eq!(up, vec![OutputItem::PassThrough { code: k, value: 0 }]);
+            apply_router_output(&mut screen, &mut held, &up);
+            assert!(!held.contains(&k));
+        }
+
+        // 2. Strafe left (hold A >= 200ms), then press W while still holding A (diagonal up-left):
+        //    W must pass through continuously (NOT turn into `ă` / KEY_6!).
+        let t_diag = t0 + Duration::from_secs(10);
+        let (a_down, _) = router.handle_raw_key_at(Key::KEY_A, 1, t_diag);
+        apply_router_output(&mut screen, &mut held, &a_down);
+        let (w_down, _) =
+            router.handle_raw_key_at(Key::KEY_W, 1, t_diag + Duration::from_millis(250));
+        assert_eq!(
+            w_down,
+            vec![OutputItem::PassThrough {
+                code: Key::KEY_W,
+                value: 1,
+            }]
+        );
+        apply_router_output(&mut screen, &mut held, &w_down);
+        assert!(held.contains(&Key::KEY_A) && held.contains(&Key::KEY_W));
+
+        // Release both, then press S immediately -> passes through (NOT `á` / KEY_2!)
+        let (a_up, _) =
+            router.handle_raw_key_at(Key::KEY_A, 0, t_diag + Duration::from_millis(400));
+        apply_router_output(&mut screen, &mut held, &a_up);
+        let (w_up, _) =
+            router.handle_raw_key_at(Key::KEY_W, 0, t_diag + Duration::from_millis(420));
+        apply_router_output(&mut screen, &mut held, &w_up);
+
+        // Hold A for 250ms, release A, then immediately press S -> must NOT turn into `á`!
+        let t_seq = t0 + Duration::from_secs(15);
+        let (a_down2, _) = router.handle_raw_key_at(Key::KEY_A, 1, t_seq);
+        apply_router_output(&mut screen, &mut held, &a_down2);
+        let (a_up2, _) =
+            router.handle_raw_key_at(Key::KEY_A, 0, t_seq + Duration::from_millis(250));
+        apply_router_output(&mut screen, &mut held, &a_up2);
+        let (s_down, _) =
+            router.handle_raw_key_at(Key::KEY_S, 1, t_seq + Duration::from_millis(270));
+        assert_eq!(
+            s_down,
+            vec![OutputItem::PassThrough {
+                code: Key::KEY_S,
+                value: 1,
+            }]
+        );
+        apply_router_output(&mut screen, &mut held, &s_down);
+        let (s_up, _) =
+            router.handle_raw_key_at(Key::KEY_S, 0, t_seq + Duration::from_millis(350));
+        apply_router_output(&mut screen, &mut held, &s_up);
+
+        // 3. Instant diagonal A+W within 20ms, then user keeps holding W past repeat delay:
+        //    value == 2 promotes W into a real continuous PassThrough hold with zero stuck keys.
+        let t_inst = t0 + Duration::from_secs(20);
+        let (ia_down, _) = router.handle_raw_key_at(Key::KEY_A, 1, t_inst);
+        apply_router_output(&mut screen, &mut held, &ia_down);
+        let (iw_down, _) =
+            router.handle_raw_key_at(Key::KEY_W, 1, t_inst + Duration::from_millis(20));
+        apply_router_output(&mut screen, &mut held, &iw_down);
+        let (iw_rep, _) =
+            router.handle_raw_key_at(Key::KEY_W, 2, t_inst + Duration::from_millis(270));
+        assert_eq!(
+            iw_rep,
+            vec![OutputItem::PassThrough {
+                code: Key::KEY_W,
+                value: 1,
+            }]
+        );
+        apply_router_output(&mut screen, &mut held, &iw_rep);
+        assert!(held.contains(&Key::KEY_A) && held.contains(&Key::KEY_W));
+        let (ia_up, _) =
+            router.handle_raw_key_at(Key::KEY_A, 0, t_inst + Duration::from_millis(500));
+        apply_router_output(&mut screen, &mut held, &ia_up);
+        let (iw_up, _) =
+            router.handle_raw_key_at(Key::KEY_W, 0, t_inst + Duration::from_millis(510));
+        apply_router_output(&mut screen, &mut held, &iw_up);
+
+        assert!(held.is_empty(), "Stuck virtual keys: {:?}", held);
+        assert!(router.passthrough_held.is_empty());
+        assert!(router.held_since.is_empty());
+    }
+
+    #[test]
+    fn fast_typing_rollover_and_long_backspace_history_restore_still_work() {
+        let mut router = TelexRouter::new(config::ToneStyle::New, true, ToggleHotkey::None);
+        let mut screen: Vec<char> = Vec::new();
+        let mut held: HashSet<Key> = HashSet::new();
+        let t0 = Instant::now();
+
+        // Fast rollover typing `toans` (`n` still held when `s` is pressed 30ms later) -> "toán"
+        for (k, down_ms, up_ms) in [
+            (Key::KEY_T, 0, 60),
+            (Key::KEY_O, 40, 100),
+            (Key::KEY_A, 80, 140),
+        ] {
+            let (d, _) = router.handle_raw_key_at(k, 1, t0 + Duration::from_millis(down_ms));
+            apply_router_output(&mut screen, &mut held, &d);
+            let (u, _) = router.handle_raw_key_at(k, 0, t0 + Duration::from_millis(up_ms));
+            apply_router_output(&mut screen, &mut held, &u);
+        }
+        let (n_down, _) = router.handle_raw_key_at(Key::KEY_N, 1, t0 + Duration::from_millis(150));
+        apply_router_output(&mut screen, &mut held, &n_down);
+        // `s` pressed while `n` is still physically held (30ms < 200ms threshold!)
+        let (s_down, _) = router.handle_raw_key_at(Key::KEY_S, 1, t0 + Duration::from_millis(180));
+        apply_router_output(&mut screen, &mut held, &s_down);
+        let (n_up, _) = router.handle_raw_key_at(Key::KEY_N, 0, t0 + Duration::from_millis(200));
+        apply_router_output(&mut screen, &mut held, &n_up);
+        let (s_up, _) = router.handle_raw_key_at(Key::KEY_S, 0, t0 + Duration::from_millis(210));
+        apply_router_output(&mut screen, &mut held, &s_up);
+        assert_eq!(screen.iter().collect::<String>(), "toán");
+
+        // Space + "ab", then hold Backspace for 400ms (>= 200ms) -> MUST STILL restore "toán"
+        for (i, k) in [Key::KEY_SPACE, Key::KEY_A, Key::KEY_B].into_iter().enumerate() {
+            let base = t0 + Duration::from_millis(250 + i as u64 * 40);
+            let (d, _) = router.handle_raw_key_at(k, 1, base);
+            apply_router_output(&mut screen, &mut held, &d);
+            let (u, _) = router.handle_raw_key_at(k, 0, base + Duration::from_millis(30));
+            apply_router_output(&mut screen, &mut held, &u);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "toán ab");
+
+        let bs_start = t0 + Duration::from_millis(500);
+        let (bs1, _) = router.handle_raw_key_at(Key::KEY_BACKSPACE, 1, bs_start);
+        apply_router_output(&mut screen, &mut held, &bs1);
+        let (bs2, _) = router.handle_raw_key_at(Key::KEY_BACKSPACE, 2, bs_start + Duration::from_millis(250));
+        apply_router_output(&mut screen, &mut held, &bs2);
+        let (bs3, _) = router.handle_raw_key_at(Key::KEY_BACKSPACE, 2, bs_start + Duration::from_millis(300));
+        apply_router_output(&mut screen, &mut held, &bs3);
+        let (bs_up, _) = router.handle_raw_key_at(Key::KEY_BACKSPACE, 0, bs_start + Duration::from_millis(400));
+        apply_router_output(&mut screen, &mut held, &bs_up);
+        assert_eq!(screen.iter().collect::<String>(), "toán");
+
+        // Pressing 'z' removes tone on restored "toán" -> "toan"
+        let (z_down, _) = router.handle_raw_key_at(Key::KEY_Z, 1, bs_start + Duration::from_millis(450));
+        apply_router_output(&mut screen, &mut held, &z_down);
+        let (z_up, _) = router.handle_raw_key_at(Key::KEY_Z, 0, bs_start + Duration::from_millis(480));
+        apply_router_output(&mut screen, &mut held, &z_up);
+        assert_eq!(screen.iter().collect::<String>(), "toan");
+
+        // Window passthrough pauses & resumes cleanly
+        assert!(!router.set_window_passthrough(true));
+        let (d, _) = router.handle_raw_key(Key::KEY_A, 1);
+        assert_eq!(d, vec![OutputItem::PassThrough { code: Key::KEY_A, value: 1 }]);
+        let (u, _) = router.handle_raw_key(Key::KEY_A, 0);
+        assert_eq!(u, vec![OutputItem::PassThrough { code: Key::KEY_A, value: 0 }]);
+        assert!(router.set_window_passthrough(false));
+
+        assert!(held.is_empty(), "Stuck virtual keys: {:?}", held);
+        assert!(router.passthrough_held.is_empty());
+        assert!(router.held_since.is_empty());
     }
 }

@@ -19,6 +19,9 @@ ipc_socket_path = "/run/vi-uinput-ime-telex/ipc.sock"
 # Optional keyboard include/exclude filters (substring match against device name or /dev/input/by-id/*)
 device_include = []
 device_exclude = []
+# Optional window class substrings (Hyprland/Sway/X11 IPC) to auto-pause IME to 100% raw PassThrough
+# (leave empty to keep Vietnamese chat working inside games like Minecraft / Goose Goose Duck)
+passthrough_apps = []
 
 [hotkey]
 # Toggle shortcut:

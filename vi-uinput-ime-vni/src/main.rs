@@ -14,12 +14,17 @@ use input::grabber::{
     emergency_ungrab_all, install_failsafe_panic_hook, spawn_device_reader, RouterEvent,
 };
 use input::scanner::{spawn_hotplug_scanner, DeviceFilter};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+
+/// Holding any non-Backspace key continuously for >= 200ms indicates intentional key-hold
+/// (e.g. WASD game movement) rather than Vietnamese syllable typing (typical dwell 40–140ms).
+const HOLD_RESET_THRESHOLD: Duration = Duration::from_millis(200);
 
 #[derive(Default)]
 struct ModifierState {
@@ -154,12 +159,16 @@ struct VniRouter {
     mods: ModifierState,
     manual_enabled: bool,
     desktop_layout_active: bool,
+    window_passthrough: bool,
     sync_desktop_layout: bool,
     toggle_hotkey: ToggleHotkey,
     /// Tracks every non-modifier key whose `value == 1` press was forwarded as `PassThrough`.
     /// Guarantees that its matching repeat (`value == 2`) and release (`value == 0`) are ALWAYS
     /// forwarded cleanly—eliminating stuck number keys (`1111...`) and Shift/Ctrl release traps.
     passthrough_held: HashSet<Key>,
+    /// Timestamp when each currently held `PassThrough` key was pressed, used to distinguish
+    /// intentional key holds (>= 200ms, e.g. WASD movement) from fast typing rollover (< 200ms).
+    held_since: HashMap<Key, Instant>,
 }
 
 impl VniRouter {
@@ -169,9 +178,11 @@ impl VniRouter {
             mods: ModifierState::default(),
             manual_enabled,
             desktop_layout_active: true,
+            window_passthrough: false,
             sync_desktop_layout: false,
             toggle_hotkey,
             passthrough_held: HashSet::new(),
+            held_since: HashMap::new(),
         }
     }
 
@@ -190,11 +201,17 @@ impl VniRouter {
     }
 
     fn effective_enabled(&self) -> bool {
-        self.manual_enabled && self.desktop_layout_active
+        self.manual_enabled && self.desktop_layout_active && !self.window_passthrough
     }
 
     fn set_desktop_layout_active(&mut self, active: bool) -> bool {
         self.desktop_layout_active = active;
+        self.engine.clear_all();
+        self.effective_enabled()
+    }
+
+    fn set_window_passthrough(&mut self, passthrough: bool) -> bool {
+        self.window_passthrough = passthrough;
         self.engine.clear_all();
         self.effective_enabled()
     }
@@ -216,14 +233,44 @@ impl VniRouter {
         self.mods.caps_lock = on;
     }
 
+    fn mark_passthrough_down(&mut self, code: Key, now: Instant) {
+        self.passthrough_held.insert(code);
+        self.held_since.insert(code, now);
+    }
+
+    fn any_key_held_long(&self, now: Instant) -> bool {
+        self.held_since.iter().any(|(&k, &pressed_at)| {
+            k != Key::KEY_BACKSPACE
+                && now.saturating_duration_since(pressed_at) >= HOLD_RESET_THRESHOLD
+        })
+    }
+
     fn handle_raw_key(&mut self, code: Key, value: i32) -> (Vec<OutputItem>, Option<bool>) {
+        self.handle_raw_key_at(code, value, Instant::now())
+    }
+
+    fn handle_raw_key_at(
+        &mut self,
+        code: Key,
+        value: i32,
+        now: Instant,
+    ) -> (Vec<OutputItem>, Option<bool>) {
         // 1. Always track & forward modifier keys verbatim
         if self.mods.update(code, value) {
             return (vec![OutputItem::PassThrough { code, value }], None);
         }
 
         // 2. Key release (`value == 0`): ALWAYS forward release iff its press was passed through!
+        //    If a non-Backspace key was held continuously for >= 200ms (e.g. WASD movement),
+        //    invalidate the syllable buffer so subsequent hotbar digits (1..9) pass cleanly.
         if value == 0 {
+            if let Some(pressed_at) = self.held_since.remove(&code) {
+                if code != Key::KEY_BACKSPACE
+                    && now.saturating_duration_since(pressed_at) >= HOLD_RESET_THRESHOLD
+                {
+                    self.engine.clear_all();
+                }
+            }
             if self.passthrough_held.remove(&code) {
                 return (vec![OutputItem::PassThrough { code, value: 0 }], None);
             }
@@ -232,10 +279,12 @@ impl VniRouter {
 
         // 3. Key repeat (`value == 2`) for already passed-through keys EXCEPT Backspace/Space
         //    (Backspace and Space must update the history ring buffer on every repeat tick).
+        //    Clear pending syllable state when a held key repeats.
         if value == 2
             && !matches!(code, Key::KEY_BACKSPACE | Key::KEY_SPACE)
             && self.passthrough_held.contains(&code)
         {
+            self.engine.clear_all();
             return (vec![OutputItem::PassThrough { code, value: 2 }], None);
         }
 
@@ -280,7 +329,7 @@ impl VniRouter {
                 self.engine.clear_all();
             }
             if value == 1 {
-                self.passthrough_held.insert(code);
+                self.mark_passthrough_down(code, now);
             }
             return (vec![OutputItem::PassThrough { code, value }], None);
         }
@@ -290,12 +339,15 @@ impl VniRouter {
         if code == Key::KEY_SPACE {
             let mut items = Vec::new();
             if value == 1 || value == 2 {
+                if value == 1 && self.any_key_held_long(now) {
+                    self.engine.clear_all();
+                }
                 if let Some(restore_batch) = self.engine.process_separator(' ') {
                     items.extend(restore_batch);
                 }
             }
             if value == 1 {
-                self.passthrough_held.insert(code);
+                self.mark_passthrough_down(code, now);
             }
             items.push(OutputItem::PassThrough { code, value });
             return (items, None);
@@ -305,6 +357,7 @@ impl VniRouter {
         if code == Key::KEY_BACKSPACE {
             if value == 1 || value == 2 {
                 if let Some(mut batch) = self.engine.process_backspace() {
+                    self.held_since.remove(&Key::KEY_BACKSPACE);
                     if self.passthrough_held.remove(&Key::KEY_BACKSPACE) {
                         batch.insert(
                             0,
@@ -321,21 +374,37 @@ impl VniRouter {
                 }
             }
             if value == 1 {
-                self.passthrough_held.insert(code);
+                self.mark_passthrough_down(code, now);
             }
             return (vec![OutputItem::PassThrough { code, value }], None);
         }
 
         // 8. VNI letters (`a..z`, `A..Z`) and unshifted top-row digits (`0..9`)
         if let Some(ch) = key_to_vni_char(code, self.mods.shift(), self.mods.caps_lock) {
-            if value == 2 && ch.is_ascii_digit() {
-                return (Vec::new(), None);
+            if value == 2 {
+                if ch.is_ascii_digit() {
+                    // Digit consumed as VNI modifier on value==1: suppress stray repeat digits.
+                    return (Vec::new(), None);
+                }
+                self.engine.clear_all();
+                self.mark_passthrough_down(code, now);
+                return (vec![OutputItem::PassThrough { code, value: 1 }], None);
             }
-            if let Some(batch) = self.engine.process_char(ch) {
+            if value == 1 && self.any_key_held_long(now) {
+                self.engine.clear_all();
+            }
+            if let Some(mut batch) = self.engine.process_char(ch) {
+                // Hold-preserving PassThrough: emit PassThrough { value: 1 } for trailing raw ASCII
+                // matching the pressed physical key so WASD & letter holds stay continuously down.
+                if value == 1 && batch.last() == Some(&OutputItem::AsciiChar(ch)) {
+                    batch.pop();
+                    self.mark_passthrough_down(code, now);
+                    batch.push(OutputItem::PassThrough { code, value: 1 });
+                }
                 return (batch, None);
             }
             if value == 1 {
-                self.passthrough_held.insert(code);
+                self.mark_passthrough_down(code, now);
             }
             return (vec![OutputItem::PassThrough { code, value }], None);
         }
@@ -345,7 +414,7 @@ impl VniRouter {
             self.engine.clear_all();
         }
         if value == 1 {
-            self.passthrough_held.insert(code);
+            self.mark_passthrough_down(code, now);
         }
         (vec![OutputItem::PassThrough { code, value }], None)
     }
@@ -546,7 +615,21 @@ async fn main() -> Result<()> {
                         router.clear_all();
                     }
                     RouterEvent::WindowFocusChanged { app_class, is_xwayland } => {
-                        router.clear_all();
+                        let prev_eff = router.effective_enabled();
+                        let new_eff =
+                            router.set_window_passthrough(config.is_passthrough_app(&app_class));
+                        if new_eff != prev_eff {
+                            write_state_file(&config.general.state_file, new_eff);
+                            info!(
+                                "Window '{}' -> VNI IME {}",
+                                app_class,
+                                if new_eff {
+                                    "ACTIVE (VI)"
+                                } else {
+                                    "PAUSED (App PassThrough)"
+                                }
+                            );
+                        }
                         let delay_ms = config.resolve_delay_ms(&app_class, is_xwayland);
                         emitter.set_delay_ms(delay_ms);
                     }
@@ -593,13 +676,18 @@ mod tests {
                         virtual_held.remove(&code);
                     }
                     if value == 1 || value == 2 {
+                        let shift = virtual_held.contains(&Key::KEY_LEFTSHIFT)
+                            || virtual_held.contains(&Key::KEY_RIGHTSHIFT);
                         match code {
                             Key::KEY_SPACE => screen.push(' '),
                             Key::KEY_BACKSPACE => {
                                 screen.pop();
                             }
-                            Key::KEY_6 => screen.push('6'),
-                            _ => {}
+                            other => {
+                                if let Some(ch) = key_to_vni_char(other, shift, false) {
+                                    screen.push(ch);
+                                }
+                            }
                         }
                     }
                 }
@@ -860,6 +948,8 @@ mod tests {
             assert_eq!(up, vec![OutputItem::PassThrough { code: k, value: 0 }]);
             apply_router_output(&mut screen, &mut held, &up);
         }
+        assert_eq!(screen.iter().collect::<String>(), "sua73");
+        screen.clear();
 
         // Desktop switches to `vi_uinput` -> VNI activates immediately (`sua73` -> "sửa")
         assert!(router.set_desktop_layout_active(true));
@@ -926,5 +1016,77 @@ mod tests {
         assert_eq!(screen.iter().collect::<String>(), "po3t ");
         assert!(held.is_empty(), "Stuck virtual keys: {:?}", held);
         assert!(router.passthrough_held.is_empty());
+    }
+
+    #[test]
+    fn game_wasd_holds_and_post_hold_hotbar_digits_work_cleanly_in_vni() {
+        let mut router = VniRouter::new(config::ToneStyle::New, true, ToggleHotkey::None);
+        let mut screen: Vec<char> = Vec::new();
+        let mut held: HashSet<Key> = HashSet::new();
+        let t0 = Instant::now();
+
+        // 1. Holding W, A, S, D stays continuously down as PassThrough (never premature value=0)
+        for (idx, k) in [Key::KEY_W, Key::KEY_A, Key::KEY_S, Key::KEY_D]
+            .into_iter()
+            .enumerate()
+        {
+            let base = t0 + Duration::from_secs(idx as u64);
+            let (down, _) = router.handle_raw_key_at(k, 1, base);
+            assert_eq!(down, vec![OutputItem::PassThrough { code: k, value: 1 }]);
+            apply_router_output(&mut screen, &mut held, &down);
+            assert!(held.contains(&k));
+
+            let (rep, _) =
+                router.handle_raw_key_at(k, 2, base + Duration::from_millis(250));
+            assert_eq!(rep, vec![OutputItem::PassThrough { code: k, value: 2 }]);
+            assert!(held.contains(&k));
+
+            let (up, _) =
+                router.handle_raw_key_at(k, 0, base + Duration::from_millis(450));
+            assert_eq!(up, vec![OutputItem::PassThrough { code: k, value: 0 }]);
+            apply_router_output(&mut screen, &mut held, &up);
+            assert!(!held.contains(&k));
+        }
+
+        // 2. Walking left (hold A >= 200ms) then pressing Minecraft hotbar `1` while holding A:
+        //    must pass `1` straight through instead of turning `a`+`1` into `á`!
+        let t_hotbar = t0 + Duration::from_secs(10);
+        let (a_down, _) = router.handle_raw_key_at(Key::KEY_A, 1, t_hotbar);
+        apply_router_output(&mut screen, &mut held, &a_down);
+        let (k1_down, _) =
+            router.handle_raw_key_at(Key::KEY_1, 1, t_hotbar + Duration::from_millis(250));
+        assert_eq!(
+            k1_down,
+            vec![OutputItem::PassThrough {
+                code: Key::KEY_1,
+                value: 1,
+            }]
+        );
+        apply_router_output(&mut screen, &mut held, &k1_down);
+        let (k1_up, _) =
+            router.handle_raw_key_at(Key::KEY_1, 0, t_hotbar + Duration::from_millis(300));
+        apply_router_output(&mut screen, &mut held, &k1_up);
+        let (a_up, _) =
+            router.handle_raw_key_at(Key::KEY_A, 0, t_hotbar + Duration::from_millis(400));
+        apply_router_output(&mut screen, &mut held, &a_up);
+
+        // 3. Normal fast VNI typing (< 200ms dwell) still composes `toan1` -> "toán"
+        screen.clear();
+        let t_type = t0 + Duration::from_secs(15);
+        for (i, k) in [Key::KEY_T, Key::KEY_O, Key::KEY_A, Key::KEY_N, Key::KEY_1]
+            .into_iter()
+            .enumerate()
+        {
+            let base = t_type + Duration::from_millis(i as u64 * 40);
+            let (d, _) = router.handle_raw_key_at(k, 1, base);
+            apply_router_output(&mut screen, &mut held, &d);
+            let (u, _) = router.handle_raw_key_at(k, 0, base + Duration::from_millis(30));
+            apply_router_output(&mut screen, &mut held, &u);
+        }
+        assert_eq!(screen.iter().collect::<String>(), "toán");
+
+        assert!(held.is_empty(), "Stuck virtual keys: {:?}", held);
+        assert!(router.passthrough_held.is_empty());
+        assert!(router.held_since.is_empty());
     }
 }

@@ -55,6 +55,10 @@ pub struct GeneralConfig {
     pub device_include: Vec<String>,
     #[serde(default)]
     pub device_exclude: Vec<String>,
+    /// Optional case-insensitive window class substrings (Hyprland/Sway/X11 IPC) where the IME
+    /// automatically pauses to 100% raw PassThrough (useful for pure-action games without VI chat).
+    #[serde(default)]
+    pub passthrough_apps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +120,7 @@ impl Default for AppConfig {
                 ipc_socket_path: default_ipc_socket_path(),
                 device_include: Vec::new(),
                 device_exclude: Vec::new(),
+                passthrough_apps: Vec::new(),
             },
             hotkey: HotkeyConfig {
                 toggle: ToggleHotkey::None,
@@ -163,6 +168,17 @@ impl AppConfig {
         }
         self.delays.default_ms
     }
+
+    pub fn is_passthrough_app(&self, app_class: &str) -> bool {
+        let needle = app_class.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return false;
+        }
+        self.general.passthrough_apps.iter().any(|raw| {
+            let pat = raw.trim().to_ascii_lowercase();
+            !pat.is_empty() && needle.contains(&pat)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -187,5 +203,13 @@ mod tests {
         assert_eq!(parsed.hotkey.toggle, ToggleHotkey::None);
         assert!(parsed.general.sync_desktop_layout);
         assert!(parsed.general.auto_restore_non_vn);
+        assert!(parsed.general.passthrough_apps.is_empty());
+        assert!(!parsed.is_passthrough_app("steam_app_1568590"));
+
+        let mut with_games = parsed;
+        with_games.general.passthrough_apps = vec!["steam_app_".to_string(), "Minecraft".to_string()];
+        assert!(with_games.is_passthrough_app("steam_app_1568590"));
+        assert!(with_games.is_passthrough_app("Minecraft* 1.21.4"));
+        assert!(!with_games.is_passthrough_app("firefox"));
     }
 }
